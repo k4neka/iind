@@ -2,7 +2,7 @@
 import os
 
 # --- OPC-UA ---
-OPCUA_URL_PRIMARY  = "opc.tcp://172.25.128.1:4840"
+OPCUA_URL_PRIMARY  = "opc.tcp://172.21.96.1:4840"
 OPCUA_URL_FALLBACK = "opc.tcp://localhost:4840"
 OPCUA_NS = 4
 OPCUA_PREFIX = "|var|CODESYS Control Win V3 x64.Application.GVL."
