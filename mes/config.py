@@ -17,11 +17,12 @@ TOPIC_MES_STATUS        = "factory/mes/status"
 
 # --- PostgreSQL (MES has its own DB) ---
 DB_CONFIG = {
-    "host":     os.getenv("PG_HOST", "localhost"),
+    "host":     os.getenv("PG_HOST", "db.fe.up.pt"),
     "port":     int(os.getenv("PG_PORT", 5432)),
-    "dbname":   os.getenv("PG_DB",   "mes"),
-    "user":     os.getenv("PG_USER", "postgres"),
-    "password": os.getenv("PG_PASS", "postgres"),
+    "dbname":   os.getenv("PG_DB",   "meec00910"),
+    "user":     os.getenv("PG_USER", "meec00910"),
+    "password": os.getenv("PG_PASS", "YfBWTHD3OwR2"),
+    "options":  "-c search_path=db_iind,public"
 }
 
 # --- Physical limits ---
