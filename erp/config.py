@@ -2,7 +2,7 @@
 import os
 
 # --- Networking ---
-TCP_HOST = "0.0.0.0"
+TCP_HOST = "127.0.0.1"
 TCP_PORT = 6666
 
 MQTT_BROKER = os.getenv("MQTT_BROKER", "localhost")
@@ -19,7 +19,7 @@ DB_CONFIG = {
     "dbname":   os.getenv("PG_DB",   "meec00910"),
     "user":     os.getenv("PG_USER", "meec00910"),
     "password": os.getenv("PG_PASS", "YfBWTHD3OwR2"),
-    "options":  "-c search_path=db_iind,public"
+    "options":  "-c search_path=db_erp,public"
 }
 
 # --- Simulation ---

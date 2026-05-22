@@ -130,7 +130,7 @@ def replan(current_day: int):
         line_id   = line["id"]
         piece     = line["piece_type"]
         remaining = line["quantity"] - line["produced"]
-        ddate     = line["ddate"]
+        ddate     = max(line["ddate"], current_day)  # clamp past-due dates to today
         penalty   = float(line["penalty"])
 
         if remaining <= 0:
@@ -155,7 +155,7 @@ def replan(current_day: int):
             prod_day = _pick_production_day(delivery_day, w2_occ, current_day)
             if prod_day is None:
                 print(f"[plan] WARN: line {line_id} cannot be produced — "
-                      f"W2 fully booked up to day {delivery_day}.")
+                      f"no feasible production day found (delivery_day={delivery_day}, current_day={current_day}). Order is past-due; will retry next day.")
                 continue
 
             # --- (C) Raw materials for this piece ---

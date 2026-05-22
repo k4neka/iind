@@ -44,6 +44,16 @@ def main():
     #    restarted mid-day after a crash)
     dispatch_today(clock.current_day(), mqtt)
 
+    # 8) Keep the main thread alive so all daemon threads (clock, TCP server,
+    #    MQTT loop) continue running. Without this the process exits immediately
+    #    after step 7, killing every daemon thread with it — which is why the
+    #    TCP port disappeared right after the "listening" message was printed.
+    _stop = threading.Event()
+    try:
+        _stop.wait()          # blocks forever until Ctrl-C
+    except KeyboardInterrupt:
+        print("\n[erp] shutting down.")
+
 
 if __name__ == "__main__":
     main()

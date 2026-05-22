@@ -49,22 +49,17 @@ class PLCClient:
         return [await self.read(f"Reg[{i}]") for i in range(REG_SIZE)]
 
     async def read_w1_count(self) -> int:
-        # TEMPORARY: g_W1_Count not yet declared in GVL. Returning 0 keeps
-        # the warehouse-update poller alive without crashing.
         try:
-            # return int(await self.read("g_W1_Count"))
-            return 0
+            return int(await self.read("g_W1_Count"))
         except Exception as e:
-            print(f"[opcua] read_w1_count failed (safe-ignored): {e}")
+            print(f"[opcua] read_w1_count failed: {e}")
             return 0
 
     async def read_w2_count(self) -> int:
-        # TEMPORARY: g_W2_Count not yet declared in GVL.
         try:
-            # return int(await self.read("g_W2_Count"))
-            return 0
+            return int(await self.read("g_W2_Count"))
         except Exception as e:
-            print(f"[opcua] read_w2_count failed (safe-ignored): {e}")
+            print(f"[opcua] read_w2_count failed: {e}")
             return 0
 
     async def cell_free(self, cell: int) -> bool:
@@ -103,50 +98,65 @@ class PLCClient:
         await self.write(f"Cell_{cell}_Top_Order.recv_cmd",
                          True, ua.VariantType.Boolean)
 
-    # ---------- Loader / Unloader / Return (TEMPORARILY DISABLED) ----------
-    #
-    # These methods will become active once the corresponding GVL variables
-    # exist in the Codesys project:
-    #     g_Loader_Wood_Qty, g_Loader_Metal_Qty, g_Loader_Exec
-    #     g_Unloader_PieceType, g_Unloader_Qty, g_Unloader_Exec
-    #     g_Return_PieceID, g_Return_Exec
-    #
-    # Until then, every method here logs the request and returns silently,
-    # so the rest of the MES (MQTT, dispatcher, poller) keeps running.
+    # ---------- Loader ----------
 
     async def trigger_loader(self, wood_qty: int, metal_qty: int):
-        print(f"[opcua][STUB] trigger_loader(wood={wood_qty}, metal={metal_qty}) "
-              f"— PLC variables not implemented yet, request ignored.")
+        """Write target quantities and pulse g_Loader_Exec.
+
+        The PLC's PRG_Loader detects the rising edge on g_Loader_Exec,
+        spawns pieces on the 5 loading lanes and sets g_Loader_Status=2
+        (DONE) when finished.  We only set Exec=TRUE here; the poller or
+        a dedicated wait loop should clear it once g_Loader_Status==DONE.
+        """
+        if wood_qty == 0 and metal_qty == 0:
+            return
         try:
-            # await self.write("g_Loader_Wood_Qty",  int(wood_qty),
-            #                  ua.VariantType.Int16)
-            # await self.write("g_Loader_Metal_Qty", int(metal_qty),
-            #                  ua.VariantType.Int16)
-            # await self.write("g_Loader_Exec", True, ua.VariantType.Boolean)
-            pass
+            await self.write("g_Loader_Wood_Qty",  int(wood_qty),
+                             ua.VariantType.Int16)
+            await self.write("g_Loader_Metal_Qty", int(metal_qty),
+                             ua.VariantType.Int16)
+            await self.write("g_Loader_Exec", True, ua.VariantType.Boolean)
+            print(f"[opcua] trigger_loader wood={wood_qty} metal={metal_qty}")
         except Exception as e:
-            print(f"[opcua] trigger_loader failed (safe-ignored): {e}")
+            print(f"[opcua] trigger_loader failed: {e}")
+
+    async def read_loader_status(self) -> int:
+        """Return g_Loader_Status: 0=IDLE, 1=LOADING, 2=DONE, 3=ERROR."""
+        try:
+            return int(await self.read("g_Loader_Status"))
+        except Exception as e:
+            print(f"[opcua] read_loader_status failed: {e}")
+            return 0
+
+    async def clear_loader_exec(self):
+        """Lower g_Loader_Exec after the PLC reports DONE/ERROR."""
+        try:
+            await self.write("g_Loader_Exec", False, ua.VariantType.Boolean)
+        except Exception as e:
+            print(f"[opcua] clear_loader_exec failed: {e}")
+
+    # ---------- Unloader ----------
 
     async def trigger_unloader(self, piece_type: str, qty: int):
-        print(f"[opcua][STUB] trigger_unloader(type={piece_type}, qty={qty}) "
-              f"— PLC variables not implemented yet, request ignored.")
+        """Request the PLC unloader to move `qty` pieces of `piece_type`."""
         try:
-            # await self.write("g_Unloader_PieceType", piece_type,
-            #                  ua.VariantType.String)
-            # await self.write("g_Unloader_Qty", int(qty),
-            #                  ua.VariantType.Int16)
-            # await self.write("g_Unloader_Exec", True, ua.VariantType.Boolean)
-            pass
+            await self.write("g_Unloader_PieceType", str(piece_type),
+                             ua.VariantType.String)
+            await self.write("g_Unloader_Qty", int(qty),
+                             ua.VariantType.Int16)
+            await self.write("g_Unloader_Exec", True, ua.VariantType.Boolean)
+            print(f"[opcua] trigger_unloader type={piece_type} qty={qty}")
         except Exception as e:
-            print(f"[opcua] trigger_unloader failed (safe-ignored): {e}")
+            print(f"[opcua] trigger_unloader failed: {e}")
+
+    # ---------- Return ----------
 
     async def trigger_return(self, piece_id: int):
-        print(f"[opcua][STUB] trigger_return(piece_id={piece_id}) "
-              f"— PLC variables not implemented yet, request ignored.")
+        """Request the PLC to return piece_id from W2 to W1 via transfer cell."""
         try:
-            # await self.write("g_Return_PieceID", int(piece_id),
-            #                  ua.VariantType.Int16)
-            # await self.write("g_Return_Exec", True, ua.VariantType.Boolean)
-            pass
+            await self.write("g_Return_PieceID", int(piece_id),
+                             ua.VariantType.Int16)
+            await self.write("g_Return_Exec", True, ua.VariantType.Boolean)
+            print(f"[opcua] trigger_return piece_id={piece_id}")
         except Exception as e:
-            print(f"[opcua] trigger_return failed (safe-ignored): {e}")
+            print(f"[opcua] trigger_return failed: {e}")

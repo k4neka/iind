@@ -21,20 +21,11 @@ class Dispatcher:
             return False
 
     async def _w2_has_room(self) -> bool:
-        # ------------------------------------------------------------------
-        # TEMPORARY BYPASS
-        # ------------------------------------------------------------------
-        # The PLC does not yet expose `g_W2_Count` over OPC-UA, so reading
-        # it would crash the MES. Until the Codesys side adds the counter,
-        # we assume W2 always has room. Re-enable the real check below as
-        # soon as `g_W2_Count` exists in the GVL.
-        #
-        # try:
-        #     return (await self.plc.read_w2_count()) < WAREHOUSE_CAPACITY
-        # except Exception as e:
-        #     print(f"[disp] read_w2_count error: {e}")
-        #     return False
-        return True
+        try:
+            return (await self.plc.read_w2_count()) < WAREHOUSE_CAPACITY
+        except Exception as e:
+            print(f"[disp] read_w2_count error: {e}")
+            return True   # fail-open: don't block dispatch on a read error
 
     async def tick(self):
         """Called periodically by the main loop."""

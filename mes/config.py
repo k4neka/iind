@@ -2,7 +2,7 @@
 import os
 
 # --- OPC-UA ---
-OPCUA_URL_PRIMARY  = "opc.tcp://172.21.96.1:4840"
+OPCUA_URL_PRIMARY  = "opc.tcp://172.25.128.1:4840"
 OPCUA_URL_FALLBACK = "opc.tcp://localhost:4840"
 OPCUA_NS = 4
 OPCUA_PREFIX = "|var|CODESYS Control Win V3 x64.Application.GVL."
@@ -22,7 +22,7 @@ DB_CONFIG = {
     "dbname":   os.getenv("PG_DB",   "meec00910"),
     "user":     os.getenv("PG_USER", "meec00910"),
     "password": os.getenv("PG_PASS", "YfBWTHD3OwR2"),
-    "options":  "-c search_path=db_iind,public"
+    "options":  "-c search_path=db_mes,public"
 }
 
 # --- Physical limits ---
@@ -33,7 +33,7 @@ REG_SIZE  = 15           # GVL.Reg[0..14]
 # --- Polling intervals (seconds) ---
 POLL_REG_INTERVAL       = 0.2
 POLL_WAREHOUSE_INTERVAL = 1.0
-DISPATCH_INTERVAL       = 0.3
+DISPATCH_INTERVAL       = 2
 
 # --- Cost rates (€ per second occupied) ---
 MACHINE_RATE_PER_SEC = 0.05      # used by cost_tracker

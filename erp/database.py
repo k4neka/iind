@@ -1,5 +1,5 @@
 """PostgreSQL persistence layer with crash recovery."""
-import threading
+import time
 from contextlib import contextmanager
 
 import psycopg2
@@ -9,7 +9,9 @@ from psycopg2 import pool
 from config import DB_CONFIG
 
 _pool = None
-_lock = threading.Lock()
+
+# Errors that indicate a server-side connection drop (need retry, not rollback).
+_STALE_ERRORS = (psycopg2.OperationalError, psycopg2.InterfaceError)
 
 
 def init_db():
@@ -98,19 +100,75 @@ def init_db():
 
 @contextmanager
 def get_conn():
-    """Borrow a connection from the pool (thread-safe)."""
-    assert _pool is not None, "init_db() must be called first"
-    conn = _pool.getconn()
+    """Yield a live, pool-managed psycopg2 connection.
+
+    The remote PostgreSQL server may silently drop idle connections (firewall /
+    idle-timeout). conn.closed only reflects the *local* state, so we probe
+    with SELECT 1 before handing the connection to the caller.  If the probe
+    fails, the broken connection is discarded (close=True) and we try again,
+    up to 3 attempts.
+
+    IMPORTANT: rollback() is called after the probe so the connection is
+    returned in a clean (no open transaction) state.
+    """
+    conn = None
+    for attempt in range(3):
+        conn = _pool.getconn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1")
+            conn.rollback()   # ← leave the connection clean; no open transaction
+            break             # probe succeeded
+        except _STALE_ERRORS:
+            print(f"[db] stale connection (attempt {attempt + 1}/3), discarding.")
+            try:
+                _pool.putconn(conn, close=True)
+            except Exception:
+                pass
+            conn = None
+            time.sleep(0.5)
+
+    if conn is None:
+        raise psycopg2.OperationalError(
+            "Could not obtain a live DB connection after 3 attempts."
+        )
+
     try:
         yield conn
+    except _STALE_ERRORS:
+        # Network failure mid-query — kill the connection and propagate.
+        if not conn.closed:
+            try:
+                conn.close()
+            except Exception:
+                pass
+        try:
+            _pool.putconn(conn, close=True)
+        except Exception:
+            pass
+        conn = None   # prevent double-putconn in finally
+        raise
     except Exception:
-        conn.rollback()
+        # Application-level error — rollback and return to pool normally.
+        if not conn.closed:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
         raise
     finally:
-        _pool.putconn(conn)
+        if conn is not None:
+            try:
+                if conn.closed:
+                    _pool.putconn(conn, close=True)
+                else:
+                    _pool.putconn(conn)
+            except Exception:
+                pass
 
 
 def _dict_cursor(conn):
+    """Return a RealDictCursor for the given connection."""
     return conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
 
 

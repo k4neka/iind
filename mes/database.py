@@ -1,5 +1,6 @@
 """Minimal persistence for the MES."""
 import threading
+import time
 from contextlib import contextmanager
 import psycopg2, psycopg2.extras
 from psycopg2 import pool
@@ -7,6 +8,43 @@ from psycopg2 import pool
 from config import DB_CONFIG
 
 _pool = None
+
+# Errors that mean the connection was dropped server-side and we should retry.
+_STALE_ERRORS = (psycopg2.OperationalError, psycopg2.InterfaceError)
+
+
+def _fresh_conn(retries: int = 3, delay: float = 1.0):
+    """Pull a connection from the pool and verify it is alive.
+
+    psycopg2's ThreadedConnectionPool recycles connections, but the remote
+    PostgreSQL server (especially one behind a firewall or with a short
+    idle-timeout) may have already closed them.  conn.closed only reflects
+    the *local* state, so we probe with a cheap round-trip query instead.
+    If the probe fails we close the broken connection and ask the pool for a
+    fresh one, retrying up to `retries` times.
+    """
+    last_exc = None
+    for attempt in range(retries):
+        conn = _pool.getconn()
+        if conn.closed:
+            _pool.putconn(conn, close=True)
+            time.sleep(delay)
+            continue
+        try:
+            conn.cursor().execute("SELECT 1")
+            conn.rollback()          # leave the connection clean
+            return conn
+        except _STALE_ERRORS as exc:
+            last_exc = exc
+            print(f"[db] stale connection detected (attempt {attempt+1}/{retries}), discarding.")
+            try:
+                _pool.putconn(conn, close=True)
+            except Exception:
+                pass
+            time.sleep(delay)
+    raise psycopg2.OperationalError(
+        f"Could not obtain a live DB connection after {retries} attempts"
+    ) from last_exc
 
 
 def init_db():
@@ -42,13 +80,50 @@ def init_db():
 
 @contextmanager
 def get_conn():
-    conn = _pool.getconn()
+    """Yield a live, pool-managed psycopg2 connection.
+
+    Strategy:
+      1. _fresh_conn() probes with SELECT 1, retrying on stale connections.
+      2. If the query inside the `with` block itself raises a network error
+         (server dropped us mid-query) we close the connection and re-raise
+         so the caller can decide whether to retry.
+      3. Non-network exceptions get a rollback; the connection is returned
+         to the pool.
+      4. Dead connections are always returned with close=True so the pool
+         drops them instead of re-using them.
+    """
+    conn = _fresh_conn()
     try:
         yield conn
+    except _STALE_ERRORS:
+        # Mid-query network failure — kill the connection and propagate.
+        if not conn.closed:
+            try:
+                conn.close()
+            except Exception:
+                pass
+        try:
+            _pool.putconn(conn, close=True)
+        except Exception:
+            pass
+        raise
     except Exception:
-        conn.rollback(); raise
+        # Application-level error — rollback and return to pool.
+        if not conn.closed:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+        raise
     finally:
-        _pool.putconn(conn)
+        # Return connection to pool; broken ones are discarded.
+        try:
+            if conn.closed:
+                _pool.putconn(conn, close=True)
+            else:
+                _pool.putconn(conn)
+        except Exception:
+            pass
 
 
 def enqueue_piece(order_id, order_line_id, piece_type):
