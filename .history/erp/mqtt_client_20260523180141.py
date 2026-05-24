@@ -33,16 +33,6 @@ class MQTTBridge:
         self.connected = (rc == 0)
         print(f"[mqtt] connected rc={rc}")
         client.subscribe(MQTT_TOPIC_MES_STATUS)
-        # Clear any stale retained material-load messages from previous runs
-        # so the MES doesn't double-count on startup.
-        self._clear_retained(MQTT_TOPIC_MATERIAL_LOAD)
-        self._clear_retained(MQTT_TOPIC_MATERIAL_LOAD_WOOD)
-        self._clear_retained(MQTT_TOPIC_MATERIAL_LOAD_METAL)
-
-    def _clear_retained(self, topic):
-        # An empty retained payload tells the broker to delete the retained
-        # message for that topic.
-        self.client.publish(topic, payload=b"", qos=1, retain=True)
 
     def _on_message(self, client, userdata, msg):
         try:
@@ -56,11 +46,9 @@ class MQTTBridge:
             return
         try:
             self.client.connect(MQTT_BROKER, MQTT_PORT, 60)
-            threading.Thread(target=self.client.loop_forever,
-                             daemon=True).start()
+            threading.Thread(target=self.client.loop_forever, daemon=True).start()
         except Exception as e:
-            print(f"[mqtt] could not connect to "
-                  f"{MQTT_BROKER}:{MQTT_PORT} ({e})")
+            print(f"[mqtt] could not connect to {MQTT_BROKER}:{MQTT_PORT} ({e})")
 
     def _publish(self, topic, payload, retain=False):
         msg = json.dumps(payload)
@@ -77,9 +65,9 @@ class MQTTBridge:
                       {"sim_day": sim_day, "items": items})
 
     def send_material_load_command(self, material_type, quantity):
-        # Per-material topic so concurrent wood/metal commands don't
-        # overwrite each other. retain=False: we don't want this surviving
-        # across MES restarts since the MES would re-consume it.
+        """Tell the MES to activate cell L and load raw material into W1.
+        Uses retain=True so the message survives MES restarts.
+        Each material has its own topic to avoid retain collision."""
         if material_type == "Wood":
             topic = MQTT_TOPIC_MATERIAL_LOAD_WOOD
         elif material_type == "Metal":
@@ -92,4 +80,4 @@ class MQTTBridge:
             "type":       material_type,
             "quantity":   quantity,
             "message_id": str(uuid.uuid4()),
-        }, retain=False)
+        }, retain=True)

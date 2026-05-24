@@ -6,11 +6,18 @@ TCP_HOST = "127.0.0.1"
 TCP_PORT = 6666
 
 MQTT_BROKER = os.getenv("MQTT_BROKER", "localhost")
-MQTT_PORT = int(os.getenv("MQTT_PORT", 1883))
-MQTT_TOPIC_PRODUCTION = "erp/production_orders"
-MQTT_TOPIC_DELIVERY = "erp/delivery_orders"
-MQTT_TOPIC_PURCHASE = "erp/purchase_orders"
-MQTT_TOPIC_MES_STATUS = "mes/status/#"
+MQTT_PORT   = int(os.getenv("MQTT_PORT", 1883))
+
+# Tópicos alinhados com o MES (prefixo factory/)
+MQTT_TOPIC_PRODUCTION  = "factory/erp/production_orders"
+MQTT_TOPIC_DELIVERY    = "factory/erp/delivery_orders"
+MQTT_TOPIC_PURCHASE    = "factory/erp/purchase_orders"
+MQTT_TOPIC_MES_STATUS  = "factory/mes/status"
+
+# Material load: um tópico distinto por material para evitar colisão de retain
+MQTT_TOPIC_MATERIAL_LOAD       = "factory/erp/material_load"        # legado
+MQTT_TOPIC_MATERIAL_LOAD_WOOD  = "factory/erp/material_load/wood"
+MQTT_TOPIC_MATERIAL_LOAD_METAL = "factory/erp/material_load/metal"
 
 # --- PostgreSQL ---
 DB_CONFIG = {
@@ -23,14 +30,14 @@ DB_CONFIG = {
 }
 
 # --- Simulation ---
-SECONDS_PER_DAY = 60
+SECONDS_PER_DAY       = 60
 PLANNING_HORIZON_DAYS = 30
 
 # --- Plant limits ---
 WAREHOUSE_CAPACITY = 32
 MAX_UNLOAD_PER_DAY = 30
 
-# --- Suppliers (Table 4 in PDF) ---
+# --- Suppliers ---
 SUPPLIERS = {
     "SupplierA": {
         "Wood":  {"min": 2,  "price": 10, "lead": 0},
@@ -42,17 +49,15 @@ SUPPLIERS = {
     },
 }
 
-# --- Final products clients can order (Rxx / Sxx, x ∈ {W,M}) ---
+# --- Final products clients can order ---
 FINAL_PRODUCTS = {"RWW", "SWW", "RWM", "SWM", "RMM", "SMM"}
 
-# --- Bill of materials (raw pieces required per finished piece) ---
-# Each final piece = 1 top + 2 legs. RtopW/StopW come from Wood, RtopM/StopM
-# from Metal. LegW from Wood, LegM from Metal.
+# --- Bill of materials ---
 BOM = {
-    "RWW": {"Wood": 3, "Metal": 0},  # RtopW(1W) + 2*LegW(2W)
+    "RWW": {"Wood": 3, "Metal": 0},
     "SWW": {"Wood": 3, "Metal": 0},
-    "RWM": {"Wood": 1, "Metal": 2},  # RtopW(1W) + 2*LegM(2M)
+    "RWM": {"Wood": 1, "Metal": 2},
     "SWM": {"Wood": 1, "Metal": 2},
-    "RMM": {"Wood": 0, "Metal": 3},  # RtopM(1M) + 2*LegM(2M)
+    "RMM": {"Wood": 0, "Metal": 3},
     "SMM": {"Wood": 0, "Metal": 3},
 }

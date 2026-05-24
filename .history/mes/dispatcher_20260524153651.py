@@ -6,23 +6,23 @@ Mirrors the CODESYS Order_generator handshake:
   3) Lower recv_cmd
   4) Wait until free_cmd rises again (cell ready for the next subpart)
   5) Repeat for the next subpart of the same final product
+
+Subparts are computed dynamically by the optimizer based on the PDF
+transformation tables -- there are no hardcoded recipes.
 """
 import asyncio
 
 from config import NUM_CELLS
 from database import queued_pieces, mark_dispatched
 from optimizer import optimise_batch
-from transformations import ID_TO_PIECE
 
 
 class Dispatcher:
-    def __init__(self, plc, mqtt_bridge):
+    def __init__(self, plc):
         self.plc = plc
-        # MES MQTT bridge: exposes w1_estimate() and w1_consume()
-        # because the PLC does not maintain g_W1_Count reliably.
-        self.mqtt = mqtt_bridge
         self._tick_count = 0
         self._last_log_tick = -100
+        # Cells currently running a subpart sequence (MES-side reservation)
         self._busy_cells: set[int] = set()
         self._busy_lock = asyncio.Lock()
 
@@ -33,29 +33,11 @@ class Dispatcher:
             print(f"[disp] cell_free({cell}) error: {e}")
             return False
 
-    def _w1_local(self) -> dict:
-        return self.mqtt.w1_estimate()
-
-    def _w1_total(self) -> int:
-        est = self._w1_local()
-        return est.get("Wood", 0) + est.get("Metal", 0)
-
-    def _can_afford(self, subparts: list[dict]) -> bool:
-        # Check the locally-tracked W1 stock can cover every raw piece
-        # this final product needs (each subpart consumes exactly one raw).
-        need = {"Wood": 0, "Metal": 0}
-        for sp in subparts:
-            raw_name = ID_TO_PIECE.get(sp["raw"])
-            if raw_name in need:
-                need[raw_name] += 1
-        est = self._w1_local()
-        return all(est.get(k, 0) >= v for k, v in need.items())
-
-    def _consume_w1(self, subparts: list[dict]):
-        for sp in subparts:
-            raw_name = ID_TO_PIECE.get(sp["raw"])
-            if raw_name in ("Wood", "Metal"):
-                self.mqtt.w1_consume(raw_name, 1)
+    async def _w1_count(self) -> int:
+        try:
+            return await self.plc.read_w1_count()
+        except Exception:
+            return 0
 
     async def tick(self):
         self._tick_count += 1
@@ -70,13 +52,12 @@ class Dispatcher:
             for c in range(1, NUM_CELLS + 1):
                 free_plc = await self._cell_free_plc(c)
                 states[c] = free_plc and (c not in self._busy_cells)
-            est = self._w1_local()
+            w1 = await self._w1_count()
             print(f"[disp] tick #{self._tick_count}: "
-                  f"{len(pending)} queued, "
-                  f"w1=wood:{est.get('Wood',0)}/metal:{est.get('Metal',0)}, "
-                  f"free={states}")
+                  f"{len(pending)} queued, w1={w1}, free={states}")
 
-        if self._w1_total() == 0:
+        # Need at least one raw piece in W1 before we attempt anything.
+        if await self._w1_count() == 0:
             if verbose:
                 print("[disp] W1 empty - waiting for material")
             return
@@ -86,17 +67,7 @@ class Dispatcher:
             return
 
         for row, target_cell, subparts in plans:
-            # Need enough raw material for ALL subparts of this final piece.
-            if not self._can_afford(subparts):
-                if verbose:
-                    est = self._w1_local()
-                    print(f"[disp] piece {row['id']} ({row['piece_type']}) "
-                          f"waiting - insufficient material "
-                          f"(have wood:{est.get('Wood',0)} "
-                          f"metal:{est.get('Metal',0)})")
-                continue
-
-            # Pick a free cell (prefer the optimizer's target).
+            # Re-pick a free cell if the optimizer's target is taken.
             cell = None
             async with self._busy_lock:
                 if (target_cell not in self._busy_cells
@@ -113,15 +84,11 @@ class Dispatcher:
                     continue
                 self._busy_cells.add(cell)
 
-            # Rewrite the cell on each op if we fell back to a different one.
+            # Rewrite the cell field on every op if we fell back to alt cell.
             if cell != target_cell:
                 for sp in subparts:
                     for op in sp["ops"]:
                         op["cell"] = cell
-
-            # Reserve raw material locally up-front so concurrent ticks
-            # don't double-allocate the same stock.
-            self._consume_w1(subparts)
 
             mark_dispatched(row["id"], cell, subparts[0]["raw"])
             print(f"[disp] piece {row['id']} ({row['piece_type']}) -> "
@@ -141,14 +108,15 @@ class Dispatcher:
                 if not ok:
                     print(f"[disp] piece {piece_id} aborted at subpart {idx}")
                     return
-            print(f"[disp] piece {piece_id} ({piece_type}) "
-                  f"all subparts sent to Cell_{cell}")
+            print(f"[disp] piece {piece_id} ({piece_type}) all subparts "
+                  f"sent to Cell_{cell}")
         finally:
             async with self._busy_lock:
                 self._busy_cells.discard(cell)
 
     async def _send_subpart(self, cell: int, sp: dict, piece_id: int,
                             idx: int, total: int) -> bool:
+        # Wait for the cell to be PLC-level free.
         for _ in range(600):
             if await self._cell_free_plc(cell):
                 break
@@ -168,6 +136,7 @@ class Dispatcher:
                   f"piece {piece_id} failed: {e}")
             return False
 
+        # Wait for cell to take the workpiece (free_cmd -> FALSE).
         for _ in range(600):
             if not await self._cell_free_plc(cell):
                 break
@@ -176,6 +145,7 @@ class Dispatcher:
             print(f"[disp] piece {piece_id} sub{idx}: free_cmd never dropped")
             return False
 
+        # Lower recv_cmd, then wait for the cell to be ready again.
         try:
             await self.plc.clear_recv_cmd(cell)
         except Exception as e:

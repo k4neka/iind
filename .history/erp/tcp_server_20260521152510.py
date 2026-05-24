@@ -9,9 +9,6 @@ from database import save_client_order
 
 class OrderServer:
     def __init__(self, clock, on_new_order):
-        # on_new_order: callable(current_day) - triggered after each
-        # successfully accepted client order so the ERP can replan AND
-        # dispatch any production planned for today.
         self.clock = clock
         self.on_new_order = on_new_order
 
@@ -30,8 +27,7 @@ class OrderServer:
                 payload = json.loads(data.decode("utf-8"))
             except json.JSONDecodeError as e:
                 conn.sendall(json.dumps({"status": "error",
-                                         "msg": f"invalid JSON: {e}"}
-                                        ).encode())
+                                         "msg": f"invalid JSON: {e}"}).encode())
                 return
 
             orders = payload if isinstance(payload, list) else [payload]
@@ -53,7 +49,7 @@ class OrderServer:
                     t = ln.get("type")
                     if t not in FINAL_PRODUCTS:
                         rejected.append(
-                            f"OrderID {oid}: '{t}' is not a final product"
+                            f"OrderID {oid}: piece '{t}' is not a final product"
                         )
                         bad = True
                         break
@@ -69,15 +65,14 @@ class OrderServer:
                 accepted += 1
 
             if accepted:
-                self.on_new_order(self.clock.current_day())
+                self.on_new_order()
 
             conn.sendall(json.dumps({
                 "status": "ok",
                 "accepted": accepted,
                 "rejected": rejected,
             }).encode())
-            print(f"[tcp] {addr} -> accepted={accepted} "
-                  f"rejected={len(rejected)}")
+            print(f"[tcp] {addr} -> accepted={accepted} rejected={len(rejected)}")
         except Exception as e:
             print(f"[tcp] error with {addr}: {e}")
         finally:

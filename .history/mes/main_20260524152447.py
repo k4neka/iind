@@ -25,17 +25,15 @@ async def main_async():
     cost = CostTracker(mqtt_publish_status=mqtt_bridge.publish_status)
 
     def on_warehouse_update(w1, w2):
-        # PLC counter (unreliable for W1 but kept for W2 visibility).
-        print(f"[wh] PLC W1={w1}/32  W2={w2}/32")
+        print(f"[wh] W1={w1}/32  W2={w2}/32")
 
     poller = Poller(plc, cost, on_warehouse_update=on_warehouse_update)
-    dispatcher = Dispatcher(plc, mqtt_bridge)
+    dispatcher = Dispatcher(plc)
 
     mqtt_bridge.start()
 
     async def dispatcher_loop():
-        # Aggressive 0.5 s tick: starts production as soon as one raw
-        # piece is available in the locally-tracked W1.
+        """Tick agressivo: 0.5 s. Mal há stock + cell livre, dispara."""
         while True:
             try:
                 await dispatcher.tick()
@@ -49,6 +47,10 @@ async def main_async():
             await asyncio.sleep(30)
 
     async def loader_ack_loop():
+        """Baixa g_Loader_Exec quando o PLC reporta DONE ou ERROR.
+        Note: trigger_loader_batched já trata disto por lote, mas mantemos
+        este loop como rede de segurança para casos em que o status fica
+        em DONE sem o caller ter feito clear."""
         while True:
             try:
                 status = await plc.read_loader_status()
@@ -60,6 +62,7 @@ async def main_async():
             await asyncio.sleep(0.5)
 
     async def loader_flush_loop():
+        """Periódico: tenta despachar buffer de material acumulado."""
         while True:
             try:
                 await mqtt_bridge.flush_loader()
