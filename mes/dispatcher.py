@@ -1,12 +1,4 @@
-"""Dispatcher: sends final products to free cells as sequential subparts.
-
-Mirrors the CODESYS Order_generator handshake:
-  1) Write Workpiece_T into Cell_X_Top_Order and raise recv_cmd
-  2) Wait until Cell_X_Top_Status.free_cmd drops (cell accepted it)
-  3) Lower recv_cmd
-  4) Wait until free_cmd rises again (cell ready for the next subpart)
-  5) Repeat for the next subpart of the same final product
-"""
+"""Dispatcher: sends final products to free cells as sequential subparts."""
 import asyncio
 
 from config import NUM_CELLS
@@ -18,8 +10,6 @@ from transformations import ID_TO_PIECE
 class Dispatcher:
     def __init__(self, plc, mqtt_bridge):
         self.plc = plc
-        # MES MQTT bridge: exposes w1_estimate() and w1_consume()
-        # because the PLC does not maintain g_W1_Count reliably.
         self.mqtt = mqtt_bridge
         self._tick_count = 0
         self._last_log_tick = -100
@@ -40,18 +30,20 @@ class Dispatcher:
         est = self._w1_local()
         return est.get("Wood", 0) + est.get("Metal", 0)
 
-    def _can_afford(self, subparts: list[dict]) -> bool:
-        # Check the locally-tracked W1 stock can cover every raw piece
-        # this final product needs (each subpart consumes exactly one raw).
+    def _need_for(self, subparts):
         need = {"Wood": 0, "Metal": 0}
         for sp in subparts:
             raw_name = ID_TO_PIECE.get(sp["raw"])
             if raw_name in need:
                 need[raw_name] += 1
+        return need
+
+    def _can_afford(self, subparts) -> bool:
+        need = self._need_for(subparts)
         est = self._w1_local()
         return all(est.get(k, 0) >= v for k, v in need.items())
 
-    def _consume_w1(self, subparts: list[dict]):
+    def _consume_w1(self, subparts):
         for sp in subparts:
             raw_name = ID_TO_PIECE.get(sp["raw"])
             if raw_name in ("Wood", "Metal"):
@@ -73,8 +65,8 @@ class Dispatcher:
             est = self._w1_local()
             print(f"[disp] tick #{self._tick_count}: "
                   f"{len(pending)} queued, "
-                  f"w1=wood:{est.get('Wood',0)}/metal:{est.get('Metal',0)}, "
-                  f"free={states}")
+                  f"w1=wood:{est.get('Wood',0)}/metal:{est.get('Metal',0)},"
+                  f" free={states}")
 
         if self._w1_total() == 0:
             if verbose:
@@ -86,17 +78,19 @@ class Dispatcher:
             return
 
         for row, target_cell, subparts in plans:
-            # Need enough raw material for ALL subparts of this final piece.
             if not self._can_afford(subparts):
                 if verbose:
                     est = self._w1_local()
+                    need = self._need_for(subparts)
                     print(f"[disp] piece {row['id']} ({row['piece_type']}) "
-                          f"waiting - insufficient material "
+                          f"waiting - need wood:{need['Wood']} "
+                          f"metal:{need['Metal']} "
                           f"(have wood:{est.get('Wood',0)} "
                           f"metal:{est.get('Metal',0)})")
                 continue
 
-            # Pick a free cell (prefer the optimizer's target).
+            # Pick a free cell. Prefer the optimizer's target; fall back
+            # to any other capable cell that is free.
             cell = None
             async with self._busy_lock:
                 if (target_cell not in self._busy_cells
@@ -104,6 +98,8 @@ class Dispatcher:
                     cell = target_cell
                 else:
                     for alt in range(1, NUM_CELLS + 1):
+                        if alt == target_cell:
+                            continue
                         if alt in self._busy_cells:
                             continue
                         if await self._cell_free_plc(alt):
@@ -113,14 +109,13 @@ class Dispatcher:
                     continue
                 self._busy_cells.add(cell)
 
-            # Rewrite the cell on each op if we fell back to a different one.
+            # If we ended up on a different cell, rewrite cell on every op.
             if cell != target_cell:
                 for sp in subparts:
                     for op in sp["ops"]:
                         op["cell"] = cell
 
-            # Reserve raw material locally up-front so concurrent ticks
-            # don't double-allocate the same stock.
+            # Reserve material now so the next tick sees up-to-date stock.
             self._consume_w1(subparts)
 
             mark_dispatched(row["id"], cell, subparts[0]["raw"])
@@ -149,6 +144,7 @@ class Dispatcher:
 
     async def _send_subpart(self, cell: int, sp: dict, piece_id: int,
                             idx: int, total: int) -> bool:
+        # Wait for the cell head to be free (PLC side).
         for _ in range(600):
             if await self._cell_free_plc(cell):
                 break
@@ -168,6 +164,7 @@ class Dispatcher:
                   f"piece {piece_id} failed: {e}")
             return False
 
+        # Wait for the cell to accept the workpiece (free_cmd -> FALSE).
         for _ in range(600):
             if not await self._cell_free_plc(cell):
                 break
@@ -176,11 +173,13 @@ class Dispatcher:
             print(f"[disp] piece {piece_id} sub{idx}: free_cmd never dropped")
             return False
 
+        # Mirror the Order_generator pattern: lower recv_cmd once accepted.
         try:
             await self.plc.clear_recv_cmd(cell)
         except Exception as e:
             print(f"[disp] clear_recv_cmd error: {e}")
 
+        # Wait until the cell head is ready for the next subpart.
         for _ in range(6000):
             if await self._cell_free_plc(cell):
                 return True

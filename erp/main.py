@@ -1,6 +1,7 @@
 """ERP entry point: starts the database, clock, TCP server, MQTT bridge,
 planner and daily dispatcher."""
 import threading
+import time
 
 from database import init_db, add_purchase_entry, get_state, set_state
 from sim_clock import SimClock
@@ -10,9 +11,6 @@ from planner import replan, dispatch_today
 
 
 def _seed_debug_materials(current_day: int):
-    # One-shot seed of raw material into the purchase plan so production
-    # can start immediately on day 0. Skipped if a previous run already
-    # did it (idempotent via sim_state.debug_seed_done).
     if get_state("debug_seed_done") == "1":
         print("[debug-seed] already done, skipping.")
         return
@@ -40,11 +38,23 @@ def _seed_debug_materials(current_day: int):
     print("[debug-seed] done.")
 
 
+def _wait_mqtt(mqtt: MQTTBridge, timeout: float = 5.0):
+    # Wait until the broker accepts the connection so the first day-0
+    # dispatch doesn't fly into the void.
+    deadline = time.time() + timeout
+    while not mqtt.connected and time.time() < deadline:
+        time.sleep(0.1)
+    if not mqtt.connected:
+        print("[erp] WARN: MQTT not connected yet, "
+              "first dispatch may be lost.")
+
+
 def main():
     init_db()
     clock = SimClock()
     mqtt = MQTTBridge()
     mqtt.start()
+    _wait_mqtt(mqtt)
 
     _seed_debug_materials(clock.current_day())
     replan(clock.current_day())
@@ -58,15 +68,16 @@ def main():
     clock.start()
 
     def on_new_order(day: int):
-        # New client orders may have created production entries scheduled
-        # for TODAY (e.g. a same-day urgent order). Replan and immediately
-        # dispatch anything due today so we don't wait for the next day.
         replan(day)
         dispatch_today(day, mqtt)
 
     server = OrderServer(clock, on_new_order)
     server.start()
 
+    # Small grace period so the MES has time to subscribe to the topics
+    # before we fire the first dispatch (otherwise QoS-1 deliveries with
+    # no subscribers are simply dropped by the broker).
+    time.sleep(2.0)
     dispatch_today(clock.current_day(), mqtt)
 
     _stop = threading.Event()
