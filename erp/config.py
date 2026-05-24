@@ -30,7 +30,7 @@ DB_CONFIG = {
 }
 
 # --- Simulation ---
-SECONDS_PER_DAY       = 60
+SECONDS_PER_DAY       = 30
 PLANNING_HORIZON_DAYS = 30
 
 # --- Plant limits ---

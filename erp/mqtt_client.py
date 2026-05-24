@@ -18,6 +18,15 @@ except ImportError:
     mqtt = None
 
 
+# Topics whose retained payload must be wiped on ERP startup so the
+# MES never picks up ghosts from a previous run.
+_RETAINED_TOPICS = [
+    MQTT_TOPIC_MATERIAL_LOAD_WOOD,
+    MQTT_TOPIC_MATERIAL_LOAD_METAL,
+    MQTT_TOPIC_MATERIAL_LOAD,
+]
+
+
 class MQTTBridge:
     def __init__(self):
         self.connected = False
@@ -33,16 +42,15 @@ class MQTTBridge:
         self.connected = (rc == 0)
         print(f"[mqtt] connected rc={rc}")
         client.subscribe(MQTT_TOPIC_MES_STATUS)
-        # Clear any stale retained material-load messages from previous runs
-        # so the MES doesn't double-count on startup.
-        self._clear_retained(MQTT_TOPIC_MATERIAL_LOAD)
-        self._clear_retained(MQTT_TOPIC_MATERIAL_LOAD_WOOD)
-        self._clear_retained(MQTT_TOPIC_MATERIAL_LOAD_METAL)
+        # Wipe stale retained messages so the MES doesn't replay them.
+        self._wipe_retained()
 
-    def _clear_retained(self, topic):
-        # An empty retained payload tells the broker to delete the retained
-        # message for that topic.
-        self.client.publish(topic, payload=b"", qos=1, retain=True)
+    def _wipe_retained(self):
+        # Publishing an empty payload with retain=True deletes the
+        # broker-stored retained message for that topic.
+        for topic in _RETAINED_TOPICS:
+            self.client.publish(topic, payload=b"", qos=1, retain=True)
+        print("[mqtt] wiped retained messages on material_load topics")
 
     def _on_message(self, client, userdata, msg):
         try:
@@ -77,9 +85,9 @@ class MQTTBridge:
                       {"sim_day": sim_day, "items": items})
 
     def send_material_load_command(self, material_type, quantity):
-        # Per-material topic so concurrent wood/metal commands don't
-        # overwrite each other. retain=False: we don't want this surviving
-        # across MES restarts since the MES would re-consume it.
+        # Retain=True so the MES can still consume the command if it
+        # boots a few seconds after the ERP. The ERP wipes retained
+        # messages at startup so old runs never bleed into new ones.
         if material_type == "Wood":
             topic = MQTT_TOPIC_MATERIAL_LOAD_WOOD
         elif material_type == "Metal":
@@ -92,4 +100,4 @@ class MQTTBridge:
             "type":       material_type,
             "quantity":   quantity,
             "message_id": str(uuid.uuid4()),
-        }, retain=False)
+        }, retain=True)

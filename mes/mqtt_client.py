@@ -2,6 +2,7 @@
 import asyncio
 import json
 import threading
+import time
 
 import paho.mqtt.client as mqtt
 
@@ -9,7 +10,14 @@ from config import (MQTT_BROKER, MQTT_PORT,
                     TOPIC_MATERIAL_LOAD, TOPIC_MATERIAL_LOAD_WOOD,
                     TOPIC_MATERIAL_LOAD_METAL,
                     TOPIC_PRODUCTION_ORDERS, TOPIC_MES_STATUS)
-from database import enqueue_piece
+from database import (enqueue_piece, is_message_consumed,
+                      mark_message_consumed)
+
+
+# Ignore retained messages that arrive within this many seconds of
+# connecting. They are assumed to be stale leftovers from a previous
+# run that the ERP hasn't had time to wipe yet.
+RETAINED_IGNORE_WINDOW_S = 5.0
 
 
 class MESMqtt:
@@ -20,35 +28,29 @@ class MESMqtt:
         self.client.on_connect = self._on_connect
         self.client.on_message = self._on_message
         self.connected = False
+        self._connect_ts = None
 
-        # Raw-material buffer awaiting dispatch to the loader.
         self._pending_wood = 0
         self._pending_metal = 0
         self._load_lock = threading.Lock()
 
-        # Dedup for material-load messages by message_id.
-        self._seen_msg_ids = set()
-
-        # Re-entrancy guard around flush_loader.
         self._flushing = False
 
-        # Local W1 estimate (PLC does not maintain g_W1_Count reliably).
+        # PLC g_W1_Count is not maintained by the current SFC; track W1
+        # locally instead.
         self._w1_local = {"Wood": 0, "Metal": 0}
         self._w1_lock = threading.Lock()
 
-    def w1_estimate(self) -> dict:
-        # Snapshot of the locally-tracked W1 buffer.
+    def w1_estimate(self):
         with self._w1_lock:
             return dict(self._w1_local)
 
-    def w1_consume(self, material: str, qty: int = 1):
-        # Called by the dispatcher whenever a workpiece leaves W1.
+    def w1_consume(self, material, qty=1):
         with self._w1_lock:
             self._w1_local[material] = max(
-                0, self._w1_local.get(material, 0) - qty
-            )
+                0, self._w1_local.get(material, 0) - qty)
 
-    def _w1_add(self, wood: int, metal: int):
+    def _w1_add(self, wood, metal):
         with self._w1_lock:
             self._w1_local["Wood"] += wood
             self._w1_local["Metal"] += metal
@@ -63,6 +65,7 @@ class MESMqtt:
 
     def _on_connect(self, client, userdata, flags, rc):
         self.connected = (rc == 0)
+        self._connect_ts = time.time()
         print(f"[mqtt] connected rc={rc}")
         client.subscribe(TOPIC_MATERIAL_LOAD)
         client.subscribe(TOPIC_MATERIAL_LOAD_WOOD)
@@ -70,9 +73,19 @@ class MESMqtt:
         client.subscribe(TOPIC_PRODUCTION_ORDERS)
 
     def _on_message(self, client, userdata, msg):
-        # Skip retained empty payloads (broker cleanup markers).
-        if msg.retain and (not msg.payload or msg.payload == b""):
+        if not msg.payload:
             return
+
+        # Drop retained material_load messages received during the
+        # boot window. They are leftovers from a previous run and the
+        # ERP will (or already did) wipe them.
+        if msg.retain and msg.topic.startswith("factory/erp/material_load"):
+            elapsed = time.time() - (self._connect_ts or time.time())
+            if elapsed < RETAINED_IGNORE_WINDOW_S:
+                print(f"[mqtt] ignoring stale retained on {msg.topic} "
+                      f"(boot window {elapsed:.1f}s)")
+                return
+
         try:
             payload = json.loads(msg.payload.decode("utf-8"))
         except Exception as e:
@@ -80,23 +93,18 @@ class MESMqtt:
             return
 
         if msg.topic.startswith("factory/erp/material_load"):
-            self._handle_material_load(payload, retained=msg.retain)
+            self._handle_material_load(payload)
         elif msg.topic == TOPIC_PRODUCTION_ORDERS:
             self._handle_production_orders(payload)
 
-    def _handle_material_load(self, p, retained=False):
-        # Retained material-load messages are stale: a previous run already
-        # consumed them. Ignore.
-        if retained:
-            print(f"[mqtt] ignoring retained material_load (stale)")
-            return
-
+    def _handle_material_load(self, p):
         msg_id = p.get("message_id")
-        if msg_id and msg_id in self._seen_msg_ids:
-            print(f"[mqtt] material_load ignored (duplicate id={msg_id[:8]})")
+        if not msg_id:
+            print("[mqtt] material_load without message_id - skipped")
             return
-        if msg_id:
-            self._seen_msg_ids.add(msg_id)
+        if is_message_consumed(msg_id):
+            return
+        mark_message_consumed(msg_id)
 
         w_added = m_added = 0
         if "items" in p:
@@ -143,7 +151,6 @@ class MESMqtt:
 
             print(f"[mqtt] flush_loader dispatching wood={w} metal={m}")
             await self.plc.trigger_loader_batched(w, m)
-            # Update local W1 estimate now that material is on the line.
             self._w1_add(w, m)
         except Exception as e:
             print(f"[mqtt] flush_loader error: {e}")
@@ -162,7 +169,7 @@ class MESMqtt:
         print(f"[mqtt] queued "
               f"{sum(int(i.get('quantity',1)) for i in items)} pieces")
 
-    def publish_status(self, payload: dict):
+    def publish_status(self, payload):
         msg = json.dumps(payload)
         self.client.publish(TOPIC_MES_STATUS, msg, qos=1)
         print(f"[mqtt-out] {TOPIC_MES_STATUS} -> {msg}")

@@ -5,6 +5,22 @@ import time
 from config import (POLL_REG_INTERVAL, POLL_WAREHOUSE_INTERVAL, REG_SIZE)
 
 
+# Map Reg[index] -> cell number.
+# This MUST match the Roff values used in PLC_PRG when instantiating
+# each Cell:
+#   Cell_1: Wout_R=5, Win_R=0
+#   Cell_2: Wout_R=6, Win_R=1
+#   Cell_3: Wout_R=7, Win_R=2
+#   Cell_4: Wout_R=8, Win_R=3
+# Any other index is ignored.
+REG_TO_CELL = {
+    5: 1, 0: 1,   # Cell_1 (Wout=5, Win=0)
+    6: 2, 1: 2,   # Cell_2 (Wout=6, Win=1)
+    7: 3, 2: 3,   # Cell_3 (Wout=7, Win=2)
+    8: 4, 3: 4,   # Cell_4 (Wout=8, Win=3)
+}
+
+
 class Poller:
     def __init__(self, plc, cost_tracker, on_warehouse_update=None):
         self.plc = plc
@@ -20,14 +36,15 @@ class Poller:
                 for i, (prev, now) in enumerate(zip(self._last_reg, cur)):
                     if prev == now:
                         continue
-                    # Reg[i] represents the piece currently inside machine i
-                    # (the PDF says GVL.Reg[0] for Cell 1, etc.). We map the
-                    # index back to a cell number when possible.
-                    cell = (i // 3) + 1  # 3 machines per cell as per layout
+                    cell = REG_TO_CELL.get(i)
+                    if cell is None:
+                        continue
                     if prev == 0 and now != 0:
-                        self.cost.machine_entered(cell, int(now), time.time())
+                        self.cost.machine_entered(cell, int(now),
+                                                  time.time())
                     elif prev != 0 and now == 0:
-                        self.cost.machine_left(cell, int(prev), time.time())
+                        self.cost.machine_left(cell, int(prev),
+                                               time.time())
                 self._last_reg = cur
             except Exception as e:
                 print(f"[poll] reg error: {e}")

@@ -1,21 +1,25 @@
-"""Production planner.
+"""Production planner with tool-change minimisation and batching.
 
-For each queued final product the planner:
+For every CHUNK of up-to-PRODUCT_BATCH_SIZE queued final products of
+the same type, the planner produces a sequence of subparts to send to a
+single cell:
 
-  1) Picks the cell to produce it on (must own the required assembly tool
-     on M3 AND the required shaping tool on M1 or M2). Cells are balanced
-     across queued pieces so we don't pile everything onto one cell.
-  2) Decomposes the product into its 3 subparts (top + leg + leg) using
-     the ASSEMBLY and SINGLE_TRANSFORM tables.
-  3) For each subpart, picks M1 or M2 of the chosen cell (whichever
-     finishes earliest accounting for tool changes).
-  4) Builds an explicit 3-operation list per subpart so the CODESYS SFC
-     can transport the workpiece through every machine of the cell:
-        - exactly one machine does real work (Tool>0, OpTime>0)
-        - the others are no-ops (Machine matches SFC slot, Tool=0,
-          OpTime=0) which the Machine_Conveyor handles via its
-          Load_Piece pass-through branch.
+  - 2 * batch_size leg subparts (all using the same shaping tool on M2
+    then M1, alternating), each followed by an M3 store (Tool=0).
+  - batch_size top subparts (same shaping tool on M1, then M3 assembly
+    with the assembly tool).
+
+Because every leg in the chunk uses the same tool, no tool swap happens
+between legs (sticky-tool heuristic). The M3 assembly tool is the only
+one that changes between phases.
+
+CAUTION on batch_size > 1: the assembly cell's M3 must have buffer
+space for (2 * batch_size) leg pieces in transit before any top piece
+arrives. Order_generator's original sequence implies a buffer of at
+least 3. Increase batch_size only after verifying the SFC can hold
+more.
 """
+from config import PRODUCT_BATCH_SIZE
 from transformations import (SINGLE_TRANSFORM, ASSEMBLY, CELL_TOOLS,
                              TOOL_CHANGE_TIME, PIECE_ID,
                              find_single, find_assembly, raw_for)
@@ -26,162 +30,200 @@ class CellTimeline:
         self.ready = {c: {1: 0.0, 2: 0.0, 3: 0.0} for c in CELL_TOOLS}
         self.tool = {c: {1: None, 2: None, 3: None} for c in CELL_TOOLS}
 
-    def cells_with_tool(self, slot: int, tool: int):
-        return [c for c in CELL_TOOLS if tool in CELL_TOOLS[c][slot]]
-
-    def cost_to_run(self, cell: int, slot: int, tool: int, duration: float,
-                   earliest_start: float = 0.0) -> tuple[float, float]:
+    def cost_to_run(self, cell, slot, tool, duration, earliest_start=0.0):
         start = max(self.ready[cell][slot], earliest_start)
         change = TOOL_CHANGE_TIME if (self.tool[cell][slot]
                                       not in (None, tool)) else 0
         return start + change, start + change + duration
 
-    def reserve(self, cell: int, slot: int, tool: int, start: float,
-                finish: float):
+    def reserve(self, cell, slot, tool, start, finish):
         self.ready[cell][slot] = finish
         self.tool[cell][slot] = tool
 
-    def cell_load(self, cell: int) -> float:
+    def cell_load(self, cell):
         return sum(self.ready[cell].values())
 
 
-def _build_ops(cell: int, real_slot: int, real_tool: int, real_time: int,
-               m3_tool: int, m3_time: int):
-    """Build the 3-operation list (M1, M2, M3) for one subpart.
-
-    Exactly one of M1/M2 carries the real shaping operation; the other is
-    a no-op pass-through. M3 either runs the assembly op (top subpart) or
-    is also a no-op (leg subparts, which the M3 will just store).
-    """
-    ops = []
-    for slot in (1, 2):
-        if slot == real_slot:
-            ops.append({"cell": cell, "machine": slot,
-                        "tool": real_tool, "op_time_s": real_time})
-        else:
-            ops.append({"cell": cell, "machine": slot,
-                        "tool": 0, "op_time_s": 0})
-    ops.append({"cell": cell, "machine": 3,
-                "tool": m3_tool, "op_time_s": m3_time})
-    return ops
+def capable_cells(piece_type: str) -> list[int]:
+    asm = find_assembly(piece_type)
+    if asm is None:
+        return []
+    top_tools = {t["tool"] for t in find_single(asm["top"])}
+    leg_tools = {t["tool"] for t in find_single(asm["leg"])}
+    out = []
+    for c in CELL_TOOLS:
+        if asm["tool"] not in CELL_TOOLS[c][3]:
+            continue
+        shaping = CELL_TOOLS[c][1] | CELL_TOOLS[c][2]
+        if (top_tools & shaping) and (leg_tools & shaping):
+            out.append(c)
+    return out
 
 
-def _best_shaping_slot(target_piece: str, cell: int, tl: CellTimeline,
-                       earliest_start: float):
-    """Return (slot, transform, start, finish) for shaping target_piece
-    on M1 or M2 of `cell` -- whichever yields the earliest finish."""
-    options = []
-    for tr in find_single(target_piece):
+def _best_slot_sticky(target_piece, cell, tl, earliest_start,
+                      prefer_slot=None):
+    """Sticky-tool slot selection. If a slot already holds the needed
+    tool, use it (zero swap cost). Otherwise pick the slot with the
+    earliest finish time, breaking ties with `prefer_slot`."""
+    transforms = find_single(target_piece)
+
+    for tr in transforms:
         for slot in (1, 2):
+            if tr["tool"] not in CELL_TOOLS[cell][slot]:
+                continue
+            if tl.tool[cell][slot] == tr["tool"]:
+                start, finish = tl.cost_to_run(cell, slot, tr["tool"],
+                                               tr["time"], earliest_start)
+                return slot, tr, start, finish
+
+    options = []
+    for tr in transforms:
+        slot_order = [prefer_slot, 3 - prefer_slot] \
+            if prefer_slot in (1, 2) else [1, 2]
+        for idx, slot in enumerate(slot_order):
+            if slot not in (1, 2):
+                continue
             if tr["tool"] not in CELL_TOOLS[cell][slot]:
                 continue
             start, finish = tl.cost_to_run(cell, slot, tr["tool"],
                                            tr["time"], earliest_start)
-            options.append((finish, start, slot, tr))
+            options.append((idx, finish, start, slot, tr))
     if not options:
         return None
     options.sort()
-    finish, start, slot, tr = options[0]
+    _, finish, start, slot, tr = options[0]
     return slot, tr, start, finish
 
 
-def _plan_one_piece(piece_type: str, tl: CellTimeline,
-                    preferred_cells: list[int] | None = None):
+def _plan_chunk(piece_type: str, count: int, tl: CellTimeline,
+                preferred_cells):
+    """Plan a chunk of `count` identical final products. Returns
+    (cell, list_of_subparts) where subparts contain 2*count legs
+    followed by `count` tops, all targeting the same cell.
+    """
     asm = find_assembly(piece_type)
     if asm is None:
         return None
 
-    # Cell must own the assembly tool on M3 AND the shaping tool for
-    # both top and leg on M1 or M2.
-    top_tools = {t["tool"] for t in find_single(asm["top"])}
-    leg_tools = {t["tool"] for t in find_single(asm["leg"])}
-
-    def cell_capable(c):
-        if asm["tool"] not in CELL_TOOLS[c][3]:
-            return False
-        shaping_slots = CELL_TOOLS[c][1] | CELL_TOOLS[c][2]
-        return bool(top_tools & shaping_slots) and \
-               bool(leg_tools & shaping_slots)
-
-    candidate_cells = [c for c in CELL_TOOLS if cell_capable(c)]
-    if not candidate_cells:
+    candidates = capable_cells(piece_type)
+    if not candidates:
         return None
 
-    # Honour caller-provided preference order (used for round-robin
-    # across many queued pieces).
-    if preferred_cells:
-        ordered = [c for c in preferred_cells if c in candidate_cells]
-        ordered += [c for c in candidate_cells if c not in ordered]
-    else:
-        ordered = sorted(candidate_cells, key=lambda c: tl.cell_load(c))
+    ordered = [c for c in preferred_cells if c in candidates]
+    ordered += [c for c in candidates if c not in ordered]
     cell = ordered[0]
 
-    subparts_spec = [
-        ("top", asm["top"]),
-        ("leg", asm["leg"]),
-        ("leg", asm["leg"]),
-    ]
-    plan = []
-    # Pieces enter the cell head sequentially. The next one cannot enter
-    # while the conveyor at slot 1 is still holding the previous one.
+    subparts = []
     cell_entry_free_at = tl.ready[cell][1]
 
-    for role, sub_piece in subparts_spec:
-        op = _best_shaping_slot(sub_piece, cell, tl, cell_entry_free_at)
-        if op is None:
+    # Phase 1: 2 * count leg subparts. Alternate between preferring M2
+    # then M1 so the two shaping machines are used in parallel.
+    for i in range(2 * count):
+        prefer = 2 if i % 2 == 0 else 1
+        picked = _best_slot_sticky(asm["leg"], cell, tl,
+                                   cell_entry_free_at,
+                                   prefer_slot=prefer)
+        if picked is None:
             return None
-        slot, tr, start, finish = op
+        slot, tr, start, finish = picked
         tl.reserve(cell, slot, tr["tool"], start, finish)
 
-        if role == "top":
-            start3, finish3 = tl.cost_to_run(cell, 3, asm["tool"],
-                                             asm["time"],
-                                             earliest_start=finish)
-            tl.reserve(cell, 3, asm["tool"], start3, finish3)
-            ops = _build_ops(cell, slot, tr["tool"], tr["time"],
-                             asm["tool"], asm["time"])
-        else:
-            ops = _build_ops(cell, slot, tr["tool"], tr["time"],
-                             m3_tool=0, m3_time=0)
-
-        plan.append({
-            "raw": PIECE_ID[raw_for(sub_piece)],
+        ops = [
+            {"cell": cell, "machine": slot,
+             "tool": tr["tool"], "op_time_s": tr["time"]},
+            {"cell": cell, "machine": 3,
+             "tool": 0, "op_time_s": 0},
+        ]
+        subparts.append({
+            "raw": PIECE_ID[raw_for(asm["leg"])],
             "ops": ops,
         })
         cell_entry_free_at = max(cell_entry_free_at, tl.ready[cell][1])
 
-    return cell, plan
+    # Phase 2: `count` top subparts, each ending in an M3 assembly.
+    for _ in range(count):
+        picked = _best_slot_sticky(asm["top"], cell, tl,
+                                   cell_entry_free_at,
+                                   prefer_slot=1)
+        if picked is None:
+            return None
+        slot, tr, start, finish = picked
+        tl.reserve(cell, slot, tr["tool"], start, finish)
+
+        start3, finish3 = tl.cost_to_run(cell, 3, asm["tool"],
+                                         asm["time"],
+                                         earliest_start=finish)
+        tl.reserve(cell, 3, asm["tool"], start3, finish3)
+
+        ops = [
+            {"cell": cell, "machine": slot,
+             "tool": tr["tool"], "op_time_s": tr["time"]},
+            {"cell": cell, "machine": 3,
+             "tool": asm["tool"], "op_time_s": asm["time"]},
+        ]
+        subparts.append({
+            "raw": PIECE_ID[raw_for(asm["top"])],
+            "ops": ops,
+        })
+        cell_entry_free_at = max(cell_entry_free_at, tl.ready[cell][1])
+
+    return cell, subparts
 
 
-def optimise_batch(queued_pieces: list[dict]):
-    """Plan a whole batch. Returns [(row, cell, [subparts...]), ...]."""
+def optimise_batch(queued_pieces):
+    """Plans the queue. Returns a list of tuples:
+        (list_of_rows, target_cell, capable_cells, subparts)
+    where list_of_rows is the chunk of DB rows (length = batch_size)
+    that share the same subpart sequence on the cell. The dispatcher
+    marks them all dispatched together and tracks completion as each
+    top subpart finishes."""
     tl = CellTimeline()
 
-    def _seed_length(row):
-        a = find_assembly(row["piece_type"])
+    # Group by piece type; preserve original DB order within each group.
+    groups: dict[str, list] = {}
+    order: list[str] = []
+    for r in queued_pieces:
+        pt = r["piece_type"]
+        if pt not in groups:
+            groups[pt] = []
+            order.append(pt)
+        groups[pt].append(r)
+
+    def _cycle_cost(pt):
+        a = find_assembly(pt)
         if a is None:
             return 0
         legs_t = max(t["time"] for t in find_single(a["leg"])) * 2
         top_t = max(t["time"] for t in find_single(a["top"]))
         return legs_t + top_t + a["time"]
 
-    queue_sorted = sorted(queued_pieces, key=lambda r: -_seed_length(r))
+    order.sort(key=lambda pt: -_cycle_cost(pt))
 
+    family_rr: dict[tuple, int] = {}
     out = []
-    # Round-robin starting cell hint per piece so the optimizer spreads
-    # final products across all capable cells (when more than one is
-    # available for a given product family).
-    rr_cells = list(CELL_TOOLS.keys())
-    rr_idx = 0
 
-    for row in queue_sorted:
-        hint = rr_cells[rr_idx % len(rr_cells):] + \
-               rr_cells[:rr_idx % len(rr_cells)]
-        rr_idx += 1
-        result = _plan_one_piece(row["piece_type"], tl,
-                                 preferred_cells=hint)
-        if result is None:
-            continue
-        cell, subparts = result
-        out.append((row, cell, subparts))
+    batch = max(1, int(PRODUCT_BATCH_SIZE))
+
+    for pt in order:
+        rows = groups[pt]
+        i = 0
+        while i < len(rows):
+            chunk_rows = rows[i:i + batch]
+            i += batch
+            n = len(chunk_rows)
+
+            caps = tuple(capable_cells(pt))
+            if not caps:
+                continue
+            idx = family_rr.get(caps, 0)
+            hint = list(caps[idx % len(caps):]) + \
+                   list(caps[:idx % len(caps)])
+            family_rr[caps] = idx + 1
+
+            result = _plan_chunk(pt, n, tl, preferred_cells=hint)
+            if result is None:
+                continue
+            cell, subparts = result
+            out.append((chunk_rows, cell, list(caps), subparts))
+
     return out

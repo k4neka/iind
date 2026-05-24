@@ -11,8 +11,7 @@ OPCUA_PREFIX       = "|var|CODESYS Control Win V3 x64.Application.GVL."
 MQTT_BROKER = os.getenv("MQTT_BROKER", "localhost")
 MQTT_PORT   = int(os.getenv("MQTT_PORT", 1883))
 
-# Material load topics — um por material para não haver colisão de retain
-TOPIC_MATERIAL_LOAD       = "factory/erp/material_load"           # legado
+TOPIC_MATERIAL_LOAD       = "factory/erp/material_load"
 TOPIC_MATERIAL_LOAD_WOOD  = "factory/erp/material_load/wood"
 TOPIC_MATERIAL_LOAD_METAL = "factory/erp/material_load/metal"
 
@@ -34,13 +33,12 @@ WAREHOUSE_CAPACITY = 32
 NUM_CELLS          = 4
 REG_SIZE           = 15
 
-# --- Loader throttling ---
-LOADER_BATCH_SIZE = 5   # peças por lote (max teórico das 5 lanes em paralelo)
+LOADER_BATCH_SIZE = 5
 
 # --- Polling intervals (seconds) ---
 POLL_REG_INTERVAL       = 0.2
 POLL_WAREHOUSE_INTERVAL = 1.0
-DISPATCH_INTERVAL       = 0.5   # mais reactivo: cells começam mal há stock
+DISPATCH_INTERVAL       = 0.5
 
 # --- Cost rates ---
 MACHINE_RATE_PER_SEC = 0.05
@@ -53,7 +51,6 @@ CELL_TOOLS = {
     4: {1: [4, 5, 6], 2: [4, 5, 6], 3: [8, 9, 10]},
 }
 
-# --- Piece ID map ---
 PIECE_ID = {
     "Wood":  1, "Metal": 2,
     "RtopW": 3, "StopW": 4, "LegW": 5,
@@ -62,3 +59,14 @@ PIECE_ID = {
     "RWM":   11, "SWM":  12,
     "RMM":   13, "SMM":  14,
 }
+
+# --- Production batching ---
+# How many final products of the SAME type to group together in one
+# dispatch to a cell. With BATCH_SIZE=N the dispatcher sends 2*N legs
+# followed by N tops to the same cell. Larger batches drastically
+# reduce tool swaps (T3 stays mounted while ALL legs flow through) at
+# the cost of needing more buffer slots in the M3 assembly storage.
+# Order_generator uses N=1 implicitly. Start at 1; raise to 2 only
+# after confirming the CODESYS M3 buffer can hold 6 simultaneous
+# pieces (4 legs + 2 tops in flight).
+PRODUCT_BATCH_SIZE = 1

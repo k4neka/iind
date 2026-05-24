@@ -1,46 +1,22 @@
 """ERP entry point: starts the database, clock, TCP server, MQTT bridge,
-planner and daily dispatcher."""
+planner and daily dispatcher.
+
+No day-0 dispatch. The first material_load is sent on the day the new
+purchase_plan rows have arrival_day == current_day, which the planner
+now anchors to the production day, not the order day. Result: no raw
+material is pre-loaded into W1 before production really needs it.
+"""
 import threading
 import time
 
-from database import init_db, add_purchase_entry, get_state, set_state
+from database import init_db
 from sim_clock import SimClock
 from tcp_server import OrderServer
 from mqtt_client import MQTTBridge
 from planner import replan, dispatch_today
 
 
-def _seed_debug_materials(current_day: int):
-    if get_state("debug_seed_done") == "1":
-        print("[debug-seed] already done, skipping.")
-        return
-
-    from config import SUPPLIERS
-    supplier = "SupplierA"
-    seeds = [("Wood", 10), ("Metal", 10)]
-
-    for material, qty in seeds:
-        info = SUPPLIERS[supplier][material]
-        arrival_day = current_day + info["lead"]
-        cost = qty * info["price"]
-        add_purchase_entry(
-            order_day=current_day,
-            arrival_day=arrival_day,
-            supplier=supplier,
-            material=material,
-            qty=qty,
-            cost=cost,
-        )
-        print(f"[debug-seed] +{qty}x {material} via {supplier} "
-              f"(arrives day {arrival_day}, cost={cost}€)")
-
-    set_state("debug_seed_done", "1")
-    print("[debug-seed] done.")
-
-
 def _wait_mqtt(mqtt: MQTTBridge, timeout: float = 5.0):
-    # Wait until the broker accepts the connection so the first day-0
-    # dispatch doesn't fly into the void.
     deadline = time.time() + timeout
     while not mqtt.connected and time.time() < deadline:
         time.sleep(0.1)
@@ -56,7 +32,9 @@ def main():
     mqtt.start()
     _wait_mqtt(mqtt)
 
-    _seed_debug_materials(clock.current_day())
+    # Compute the plan but do NOT dispatch on startup. The first
+    # dispatch happens via on_new_day (or on_new_order if a client
+    # places an order whose prod_day is today).
     replan(clock.current_day())
 
     def on_new_day(day: int):
@@ -73,12 +51,6 @@ def main():
 
     server = OrderServer(clock, on_new_order)
     server.start()
-
-    # Small grace period so the MES has time to subscribe to the topics
-    # before we fire the first dispatch (otherwise QoS-1 deliveries with
-    # no subscribers are simply dropped by the broker).
-    time.sleep(2.0)
-    dispatch_today(clock.current_day(), mqtt)
 
     _stop = threading.Event()
     try:

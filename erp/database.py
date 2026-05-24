@@ -380,3 +380,16 @@ def save_raw_cost(order_line_id, sim_day, raw_cost):
             (order_line_id, sim_day, raw_cost),
         )
         conn.commit()
+
+def purchases_arriving_on(day):
+    # Purchases whose material physically arrives at W1 on `day`,
+    # regardless of when they were ordered. Used by dispatch_today so
+    # the MES gets a material_load on the actual delivery day.
+    with get_conn() as conn:
+        cur = _dict_cursor(conn)
+        cur.execute(
+            "SELECT * FROM purchase_plan "
+            "WHERE arrival_day=%s AND placed=FALSE",
+            (day,),
+        )
+        return cur.fetchall()

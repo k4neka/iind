@@ -8,21 +8,10 @@ from psycopg2 import pool
 from config import DB_CONFIG
 
 _pool = None
-
-# Errors that mean the connection was dropped server-side and we should retry.
 _STALE_ERRORS = (psycopg2.OperationalError, psycopg2.InterfaceError)
 
 
 def _fresh_conn(retries: int = 3, delay: float = 1.0):
-    """Pull a connection from the pool and verify it is alive.
-
-    psycopg2's ThreadedConnectionPool recycles connections, but the remote
-    PostgreSQL server (especially one behind a firewall or with a short
-    idle-timeout) may have already closed them.  conn.closed only reflects
-    the *local* state, so we probe with a cheap round-trip query instead.
-    If the probe fails we close the broken connection and ask the pool for a
-    fresh one, retrying up to `retries` times.
-    """
     last_exc = None
     for attempt in range(retries):
         conn = _pool.getconn()
@@ -32,11 +21,11 @@ def _fresh_conn(retries: int = 3, delay: float = 1.0):
             continue
         try:
             conn.cursor().execute("SELECT 1")
-            conn.rollback()          # leave the connection clean
+            conn.rollback()
             return conn
         except _STALE_ERRORS as exc:
             last_exc = exc
-            print(f"[db] stale connection detected (attempt {attempt+1}/{retries}), discarding.")
+            print(f"[db] stale connection (attempt {attempt+1}/{retries})")
             try:
                 _pool.putconn(conn, close=True)
             except Exception:
@@ -74,49 +63,32 @@ def init_db():
             left_at     TIMESTAMPTZ,
             duration_s  NUMERIC
         );
+        CREATE TABLE IF NOT EXISTS consumed_messages (
+            message_id  TEXT PRIMARY KEY,
+            consumed_at TIMESTAMPTZ DEFAULT NOW()
+        );
         """)
         conn.commit()
 
 
 @contextmanager
 def get_conn():
-    """Yield a live, pool-managed psycopg2 connection.
-
-    Strategy:
-      1. _fresh_conn() probes with SELECT 1, retrying on stale connections.
-      2. If the query inside the `with` block itself raises a network error
-         (server dropped us mid-query) we close the connection and re-raise
-         so the caller can decide whether to retry.
-      3. Non-network exceptions get a rollback; the connection is returned
-         to the pool.
-      4. Dead connections are always returned with close=True so the pool
-         drops them instead of re-using them.
-    """
     conn = _fresh_conn()
     try:
         yield conn
     except _STALE_ERRORS:
-        # Mid-query network failure — kill the connection and propagate.
         if not conn.closed:
-            try:
-                conn.close()
-            except Exception:
-                pass
-        try:
-            _pool.putconn(conn, close=True)
-        except Exception:
-            pass
+            try: conn.close()
+            except Exception: pass
+        try: _pool.putconn(conn, close=True)
+        except Exception: pass
         raise
     except Exception:
-        # Application-level error — rollback and return to pool.
         if not conn.closed:
-            try:
-                conn.rollback()
-            except Exception:
-                pass
+            try: conn.rollback()
+            except Exception: pass
         raise
     finally:
-        # Return connection to pool; broken ones are discarded.
         try:
             if conn.closed:
                 _pool.putconn(conn, close=True)
@@ -139,7 +111,8 @@ def enqueue_piece(order_id, order_line_id, piece_type):
 def queued_pieces():
     with get_conn() as conn:
         cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-        cur.execute("SELECT * FROM pending_pieces WHERE status='QUEUED' ORDER BY id")
+        cur.execute("SELECT * FROM pending_pieces WHERE status='QUEUED' "
+                    "ORDER BY id")
         return cur.fetchall()
 
 
@@ -158,7 +131,8 @@ def mark_completed(piece_pk, real_cost):
     with get_conn() as conn:
         cur = conn.cursor()
         cur.execute("""UPDATE pending_pieces
-                          SET status='COMPLETED', real_cost=%s, finished_at=NOW()
+                          SET status='COMPLETED', real_cost=%s,
+                              finished_at=NOW()
                         WHERE id=%s""", (real_cost, piece_pk))
         conn.commit()
 
@@ -181,4 +155,23 @@ def log_machine_event(cell, piece_id, entered_at, left_at, duration_s):
                        (cell, piece_id, entered_at, left_at, duration_s)
                        VALUES(%s,%s,%s,%s,%s)""",
                     (cell, piece_id, entered_at, left_at, duration_s))
+        conn.commit()
+
+
+def is_message_consumed(message_id: str) -> bool:
+    # True if we've already processed a material_load with this id.
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT 1 FROM consumed_messages WHERE message_id=%s",
+                    (message_id,))
+        return cur.fetchone() is not None
+
+
+def mark_message_consumed(message_id: str):
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO consumed_messages(message_id) VALUES(%s) "
+            "ON CONFLICT (message_id) DO NOTHING", (message_id,)
+        )
         conn.commit()
