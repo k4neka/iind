@@ -1,15 +1,22 @@
-"""Process knowledge: piece transformations and per-machine tool capabilities.
+"""Process knowledge: piece transformations and per-machine tool
+capabilities. Mirrors Tables 1, 2 and 3 of the project PDF (v1.1).
 
-This module mirrors Tables 1 and 3 of the project PDF.  Recipes for final
-products are NOT hardcoded; instead, the planner derives them dynamically
-from these primitives.
+Tool families (Table 1 of the PDF):
+  - M1a, M1b, M2a, M2b -> T1, T2, T3  (wood shaping)
+  - M3a, M3b, M4a, M4b -> T4, T5, T6  (metal shaping)
+  - M1c, M3c           -> T8, T9, T11 (assembly + alt LegM)
+  - M2c, M4c           -> T8, T9, T10 (assembly + alt LegW)
+
+Note that T10 (alt LegW) and T11 (alt LegM) appear ONLY in the M*c
+machines (i.e. the M3 slot inside each cell). They are shaping tools
+that happen to live on the assembly machine. Whether to use them is a
+scheduling choice the optimiser can later exploit.
 """
 
-# Raw piece IDs the loader pushes into W1
 RAW_WOOD = 1
 RAW_METAL = 2
 
-# Piece name <-> numeric ID (Table 2 of the PDF)
+# Table 2 of the PDF (with Piece IDs added in v1.1).
 PIECE_ID = {
     "Wood": 1, "Metal": 2,
     "RtopW": 3, "StopW": 4, "LegW": 5,
@@ -19,25 +26,25 @@ PIECE_ID = {
 }
 ID_TO_PIECE = {v: k for k, v in PIECE_ID.items()}
 
-# Final products (the only ones the ERP/clients can order)
 FINAL_PRODUCTS = {"RWW", "SWW", "RWM", "SWM", "RMM", "SMM"}
 
-# Single-input transformations from Table 3 (raw + tool -> product).
-# A list of dicts so multiple ways can exist for the same product (e.g.
-# LegW from T3 OR T10, LegM from T5 OR T11).
+# Shaping transformations (Table 3 of the PDF, single-input rows).
+# Every entry is a viable way to produce `out` from `in` using `tool`
+# for `time` seconds. Multiple rows for the same `out` mean the
+# scheduler has alternatives.
 SINGLE_TRANSFORM = [
     {"in": "Wood",  "out": "RtopW", "tool": 1,  "time": 30},
     {"in": "Wood",  "out": "StopW", "tool": 2,  "time": 20},
     {"in": "Wood",  "out": "LegW",  "tool": 3,  "time": 10},
-    {"in": "Wood",  "out": "LegW",  "tool": 10, "time": 30},
+    {"in": "Wood",  "out": "LegW",  "tool": 10, "time": 30},  # alt
     {"in": "Metal", "out": "RtopM", "tool": 4,  "time": 35},
     {"in": "Metal", "out": "StopM", "tool": 6,  "time": 25},
     {"in": "Metal", "out": "LegM",  "tool": 5,  "time": 30},
-    {"in": "Metal", "out": "LegM",  "tool": 11, "time": 40},
+    {"in": "Metal", "out": "LegM",  "tool": 11, "time": 40},  # alt
 ]
 
-# Assembly transformations: a top + 2 legs -> final product.
-# Each entry lists the required inputs (with counts) and the assembly op.
+# Assembly transformations (Table 3, three-input rows).
+# All final products use T8 except RWM and SWM (which use T9).
 ASSEMBLY = [
     {"out": "RWW", "top": "RtopW", "leg": "LegW", "tool": 8, "time": 10},
     {"out": "SWW", "top": "StopW", "leg": "LegW", "tool": 8, "time": 10},
@@ -47,10 +54,9 @@ ASSEMBLY = [
     {"out": "SMM", "top": "StopM", "leg": "LegM", "tool": 8, "time": 10},
 ]
 
-# Tool availability per (cell, machine_slot).  Machine slot is 1, 2 or 3
-# (M1, M2, M3 within the cell).  Mirrors PLC_PRG instantiation in CODESYS.
-# Cells 1 and 2 carry the "wood/metal shaping" tool families on M1/M2 and
-# the assembly tools on M3; cells 3 and 4 are the metal-leg variants.
+# Tool availability per (cell, machine_slot). Mirrors PLC_PRG.
+# Slot 1 = M1a/M1b/etc (first shaping), slot 2 = same family
+# (parallel shaping), slot 3 = Mxc (assembly + alt shaping).
 CELL_TOOLS = {
     1: {1: {1, 2, 3}, 2: {1, 2, 3}, 3: {8, 9, 11}},
     2: {1: {1, 2, 3}, 2: {1, 2, 3}, 3: {8, 9, 10}},
@@ -58,17 +64,16 @@ CELL_TOOLS = {
     4: {1: {4, 5, 6}, 2: {4, 5, 6}, 3: {8, 9, 10}},
 }
 
-# Time penalty for swapping any two tools on a machine (Table 1 footnote).
+# Section 2 of the PDF: "Changing between any two tools takes 30 seconds."
 TOOL_CHANGE_TIME = 30
 
 
 def find_single(out_piece: str):
-    """Return all viable (raw, tool, time) ways to produce `out_piece`."""
+    """All viable shaping recipes for `out_piece`."""
     return [t for t in SINGLE_TRANSFORM if t["out"] == out_piece]
 
 
 def find_assembly(out_piece: str):
-    """Return the assembly entry that yields `out_piece`, or None."""
     for a in ASSEMBLY:
         if a["out"] == out_piece:
             return a
@@ -76,7 +81,6 @@ def find_assembly(out_piece: str):
 
 
 def raw_for(piece: str) -> str | None:
-    """Walk back the transformation graph until a raw material is found."""
     if piece in ("Wood", "Metal"):
         return piece
     s = find_single(piece)

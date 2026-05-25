@@ -1,9 +1,17 @@
 """Dispatcher: sends final products to free cells as sequential subparts.
 
-The optimizer now groups up to PRODUCT_BATCH_SIZE products of the same
-type into a single chunk. The dispatcher sends every subpart of the
-chunk sequentially to the chosen cell, and marks ALL rows in the chunk
-as dispatched once the sequence is committed.
+Key improvements vs previous version:
+
+* Persistent round-robin across capable cells, kept on the Dispatcher
+  instance. Two separate single-piece orders for the same final
+  product now land on different cells if both are free, instead of
+  piling onto Cell_1.
+* `_choose_free_cell` actively scans every capable cell on every tick
+  and picks the first one that is both PLC-free and not already busy
+  in this MES, *independently* of the optimiser's hint.
+* Cells in `_busy_cells` are released only after every subpart of the
+  chunk has been accepted by the cell head, preserving the original
+  pipeline guarantee.
 """
 import asyncio
 
@@ -21,8 +29,14 @@ class Dispatcher:
         self._last_log_tick = -100
         self._busy_cells: set[int] = set()
         self._busy_lock = asyncio.Lock()
+        # Persistent round-robin offsets per capable-cell family.
+        # Survives across optimise_batch() calls so two separate
+        # orders for the same final product spread across cells.
+        self._family_rr: dict[tuple, int] = {}
 
-    async def _cell_free_plc(self, cell):
+    # ---- helpers --------------------------------------------------------
+
+    async def _cell_free_plc(self, cell: int) -> bool:
         try:
             return await self.plc.cell_free(cell)
         except Exception as e:
@@ -55,6 +69,26 @@ class Dispatcher:
             if raw_name in ("Wood", "Metal"):
                 self.mqtt.w1_consume(raw_name, 1)
 
+    async def _choose_free_cell(self, capable, target_hint):
+        """Return the first cell in `capable` that is both PLC-free
+        and not held by another in-flight chunk. `target_hint` is
+        tried first to honour the optimiser's preference."""
+        ordered = []
+        if target_hint in capable:
+            ordered.append(target_hint)
+        for c in capable:
+            if c not in ordered:
+                ordered.append(c)
+
+        for c in ordered:
+            if c in self._busy_cells:
+                continue
+            if await self._cell_free_plc(c):
+                return c
+        return None
+
+    # ---- main tick ------------------------------------------------------
+
     async def tick(self):
         self._tick_count += 1
         pending = queued_pieces()
@@ -71,15 +105,22 @@ class Dispatcher:
             est = self._w1_local()
             print(f"[disp] tick #{self._tick_count}: "
                   f"{len(pending)} queued, "
-                  f"w1=wood:{est.get('Wood',0)}/metal:{est.get('Metal',0)},"
-                  f" free={states}")
+                  f"w1=wood:{est.get('Wood',0)}/"
+                  f"metal:{est.get('Metal',0)}, "
+                  f"free={states}")
 
         if self._w1_total() == 0:
             if verbose:
                 print("[disp] W1 empty - waiting for material")
             return
 
-        chunks = optimise_batch(pending)
+        chunks, new_rr = optimise_batch(
+            pending, rr_offset_by_family=self._family_rr
+        )
+        # Persist round-robin so the NEXT tick (and the next replan
+        # triggered by a new client order) keeps rotating cells.
+        self._family_rr = new_rr
+
         if not chunks:
             return
 
@@ -96,30 +137,18 @@ class Dispatcher:
                           f"metal:{est.get('Metal',0)})")
                 continue
 
-            cell = None
             async with self._busy_lock:
-                if (target_cell in capable
-                        and target_cell not in self._busy_cells
-                        and await self._cell_free_plc(target_cell)):
-                    cell = target_cell
-                else:
-                    for alt in capable:
-                        if alt == target_cell:
-                            continue
-                        if alt in self._busy_cells:
-                            continue
-                        if await self._cell_free_plc(alt):
-                            cell = alt
-                            break
+                cell = await self._choose_free_cell(capable, target_cell)
                 if cell is None:
                     if verbose:
                         print(f"[disp] chunk of {len(chunk_rows)} "
-                              f"({chunk_rows[0]['piece_type']}) waiting "
-                              f"- no capable cell free "
+                              f"({chunk_rows[0]['piece_type']}) "
+                              f"waiting - no capable cell free "
                               f"(capable={capable})")
                     continue
                 self._busy_cells.add(cell)
 
+            # Rewrite ops to reflect the cell actually chosen.
             if cell != target_cell:
                 for sp in subparts:
                     for op in sp["ops"]:
@@ -129,24 +158,28 @@ class Dispatcher:
             for row in chunk_rows:
                 mark_dispatched(row["id"], cell, subparts[0]["raw"])
             print(f"[disp] chunk of {len(chunk_rows)} "
-                  f"({chunk_rows[0]['piece_type']}) -> Cell_{cell} as "
-                  f"{len(subparts)} subparts")
+                  f"({chunk_rows[0]['piece_type']}) -> Cell_{cell} "
+                  f"as {len(subparts)} subparts "
+                  f"(hint was Cell_{target_cell})")
 
             asyncio.create_task(
                 self._run_chunk(chunk_rows, cell, subparts)
             )
 
+    # ---- subpart send loop ---------------------------------------------
+
     async def _run_chunk(self, chunk_rows, cell, subparts):
         try:
             for idx, sp in enumerate(subparts, start=1):
-                ok = await self._send_subpart(cell, sp, chunk_rows[0]["id"],
-                                              idx, len(subparts))
+                ok = await self._send_subpart(
+                    cell, sp, chunk_rows[0]["id"], idx, len(subparts)
+                )
                 if not ok:
                     print(f"[disp] chunk aborted at subpart {idx}")
                     return
             print(f"[disp] chunk of {len(chunk_rows)} "
-                  f"({chunk_rows[0]['piece_type']}) all subparts sent to "
-                  f"Cell_{cell}")
+                  f"({chunk_rows[0]['piece_type']}) all subparts sent "
+                  f"to Cell_{cell}")
         finally:
             async with self._busy_lock:
                 self._busy_cells.discard(cell)
@@ -172,7 +205,7 @@ class Dispatcher:
                   f"chunk piece {piece_id} failed: {e}")
             return False
 
-        # Wait for the cell to take the workpiece.
+        # Wait for the cell to take the workpiece (free_cmd drops).
         for _ in range(600):
             if not await self._cell_free_plc(cell):
                 break

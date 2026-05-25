@@ -1,4 +1,11 @@
-"""MQTT bridge: subscribes to ERP topics and publishes MES status."""
+"""MQTT bridge: subscribes to ERP topics and publishes MES status.
+
+Maintains a *local* W1 estimate (wood/metal) because the PLC's
+g_W1_Count is not authoritative in the current CODESYS project. The
+estimate is incremented when raw material is successfully dispatched
+to the Loader and decremented when the dispatcher consumes a piece
+for production.
+"""
 import asyncio
 import json
 import threading
@@ -36,10 +43,12 @@ class MESMqtt:
 
         self._flushing = False
 
-        # PLC g_W1_Count is not maintained by the current SFC; track W1
-        # locally instead.
+        # Local W1 inventory model. Tracked here because the PLC does
+        # not maintain g_W1_Count reliably in the current project.
         self._w1_local = {"Wood": 0, "Metal": 0}
         self._w1_lock = threading.Lock()
+
+    # ---- W1 estimate API -----------------------------------------------
 
     def w1_estimate(self):
         with self._w1_lock:
@@ -49,11 +58,28 @@ class MESMqtt:
         with self._w1_lock:
             self._w1_local[material] = max(
                 0, self._w1_local.get(material, 0) - qty)
+            print(f"[w1] -{qty} {material} (now wood:"
+                  f"{self._w1_local['Wood']} "
+                  f"metal:{self._w1_local['Metal']})")
 
     def _w1_add(self, wood, metal):
         with self._w1_lock:
             self._w1_local["Wood"] += wood
             self._w1_local["Metal"] += metal
+            print(f"[w1] +wood={wood} +metal={metal} (now wood:"
+                  f"{self._w1_local['Wood']} "
+                  f"metal:{self._w1_local['Metal']})")
+
+    def w1_reset(self, wood=0, metal=0):
+        """Reset the local W1 model. Call this on MES startup if the
+        physical line was reset, or when re-syncing with a trusted
+        external source of truth."""
+        with self._w1_lock:
+            self._w1_local["Wood"] = int(wood)
+            self._w1_local["Metal"] = int(metal)
+            print(f"[w1] RESET to wood={wood} metal={metal}")
+
+    # ---- MQTT plumbing -------------------------------------------------
 
     def start(self):
         try:
@@ -76,9 +102,6 @@ class MESMqtt:
         if not msg.payload:
             return
 
-        # Drop retained material_load messages received during the
-        # boot window. They are leftovers from a previous run and the
-        # ERP will (or already did) wipe them.
         if msg.retain and msg.topic.startswith("factory/erp/material_load"):
             elapsed = time.time() - (self._connect_ts or time.time())
             if elapsed < RETAINED_IGNORE_WINDOW_S:
@@ -97,31 +120,42 @@ class MESMqtt:
         elif msg.topic == TOPIC_PRODUCTION_ORDERS:
             self._handle_production_orders(payload)
 
+    # ---- material_load -------------------------------------------------
+
     def _handle_material_load(self, p):
         msg_id = p.get("message_id")
         if not msg_id:
             print("[mqtt] material_load without message_id - skipped")
             return
         if is_message_consumed(msg_id):
+            print(f"[mqtt] material_load {msg_id} already consumed - "
+                  f"skip")
             return
         mark_message_consumed(msg_id)
 
         w_added = m_added = 0
         if "items" in p:
             for it in p["items"]:
-                t = it.get("type"); q = int(it.get("quantity", 0))
-                if t == "Wood":   w_added += q
-                elif t == "Metal": m_added += q
+                t = it.get("type")
+                q = int(it.get("quantity", 0))
+                if t == "Wood":
+                    w_added += q
+                elif t == "Metal":
+                    m_added += q
         else:
-            t = p.get("type"); q = int(p.get("quantity", 0))
-            if t == "Wood":   w_added = q
-            elif t == "Metal": m_added = q
+            t = p.get("type")
+            q = int(p.get("quantity", 0))
+            if t == "Wood":
+                w_added = q
+            elif t == "Metal":
+                m_added = q
 
         with self._load_lock:
-            self._pending_wood  += w_added
+            self._pending_wood += w_added
             self._pending_metal += m_added
-            print(f"[mqtt] material_load +wood={w_added} +metal={m_added} "
-                  f"(buffer: wood={self._pending_wood} "
+            print(f"[mqtt] material_load +wood={w_added} "
+                  f"+metal={m_added} (pending buffer: "
+                  f"wood={self._pending_wood} "
                   f"metal={self._pending_metal})")
 
         asyncio.run_coroutine_threadsafe(self.flush_loader(), self.loop)
@@ -157,17 +191,22 @@ class MESMqtt:
         finally:
             self._flushing = False
 
+    # ---- production orders ---------------------------------------------
+
     def _handle_production_orders(self, p):
         items = p.get("items", [])
         order_id = p.get("order_id")
+        total = 0
         for it in items:
             qty = int(it.get("quantity", 1))
+            total += qty
             for _ in range(qty):
                 enqueue_piece(order_id=it.get("order_id") or order_id,
                               order_line_id=it.get("order_line_id"),
                               piece_type=it["piece_type"])
-        print(f"[mqtt] queued "
-              f"{sum(int(i.get('quantity',1)) for i in items)} pieces")
+        print(f"[mqtt] queued {total} pieces from production_orders")
+
+    # ---- status publishing ---------------------------------------------
 
     def publish_status(self, payload):
         msg = json.dumps(payload)
