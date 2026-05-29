@@ -1,0 +1,262 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>MES Cloud Dashboard – Flexible Production Line</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Rajdhani:wght@400;600;700&family=JetBrains+Mono:wght@400;700&family=DM+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+<!-- Include Paho MQTT -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/paho-mqtt/1.0.1/mqttws31.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
+<style>
+  *,*::before,*::after{box-sizing:border-box;margin:0;padding:0;}
+  :root{
+    --bg0:#060b12;--bg1:#0a0f1a;--bg2:#0d1117;--bg3:#111827;--bg4:#1a2332;
+    --border:#1f2937;--border2:#1a2030;
+    --text1:#f1f5f9;--text2:#94a3b8;--text3:#64748b;
+    --amber:#f59e0b;--amber2:#fbbf24;--blue:#38bdf8;--green:#4ade80;--purple:#a78bfa;--red:#ef4444;
+    --font-head:'Rajdhani',sans-serif;--font-mono:'JetBrains Mono',monospace;--font-body:'DM Sans',sans-serif;
+  }
+  body{background:var(--bg0);color:var(--text1);font-family:var(--font-body);font-size:13px;min-height:100vh;}
+  #header{position:sticky;top:0;z-index:50;background:var(--bg1);border-bottom:1px solid #1a2540;height:52px;display:flex;align-items:center;justify-content:space-between;padding:0 24px;}
+  #logo{font-family:var(--font-head);font-size:20px;font-weight:700;letter-spacing:3px;color:var(--amber);display:flex;align-items:center;gap:8px;}
+  #status-bar{display:flex;align-items:center;gap:20px;font-size:11px;color:var(--text3);}
+  #ws-dot{width:8px;height:8px;border-radius:50%;background:var(--text3);display:inline-block;}
+  #ws-dot.live{background:var(--green);animation:pulse-dot 1.4s ease-in-out infinite;}
+  #ws-dot.error{background:var(--red);}
+  #ws-label{font-size:11px;color:var(--text3);letter-spacing:1px;}
+  #ws-label.live{color:var(--green);}#ws-label.error{color:var(--red);}
+  @keyframes pulse-dot{0%,100%{opacity:1}50%{opacity:.3}}
+  #content{padding:20px 24px;max-width:1400px;margin:0 auto;}
+  .panel{background:var(--bg2);border:1px solid var(--border);border-radius:8px;padding:16px;margin-bottom:16px;}
+  .panel-title{font-family:var(--font-head);font-size:16px;font-weight:700;color:var(--amber);letter-spacing:2px;margin-bottom:12px;text-transform:uppercase;border-bottom:1px solid var(--border2);padding-bottom:6px;}
+  
+  .kpi-row{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:20px;}
+  .kpi-card{background:var(--bg2);border-radius:8px;padding:14px 18px; border:1px solid var(--border);}
+  .kpi-val{font-family:var(--font-head);font-size:32px;font-weight:700;line-height:1;}
+  .kpi-sub{font-size:10px;color:var(--text3);letter-spacing:1px;margin-top:4px;}
+  
+  table{width:100%;border-collapse:collapse;font-size:12px;}
+  th{padding:8px 12px;text-align:left;color:var(--text3);font-weight:600;letter-spacing:1px;font-size:10px;border-bottom:1px solid var(--border);white-space:nowrap;}
+  td{padding:7px 12px;border-bottom:1px solid var(--border2);}
+  tr:hover{background:var(--bg4);}
+  
+  .pct-bar{height:6px;background:var(--border);border-radius:3px;overflow:hidden;margin-top:4px;width:100px;}
+  .pct-fill{height:100%;background:var(--blue);transition:width 0.3s;}
+  .chart-wrap{position:relative;width:100%;height:250px;}
+
+  .conn-form{display:flex;gap:10px;align-items:center;background:var(--bg2);border:1px solid var(--border);border-radius:8px;padding:12px 16px;margin-bottom:20px;}
+  .conn-input{background:var(--bg3);border:1px solid var(--border);color:var(--text1);padding:6px 10px;border-radius:4px;font-family:var(--font-mono);font-size:12px;width:200px;}
+  .conn-btn{padding:7px 20px;background:var(--amber);color:var(--bg0);border:none;border-radius:4px;font-family:var(--font-head);font-weight:700;font-size:13px;letter-spacing:1px;cursor:pointer;}
+  .conn-btn:hover{background:var(--amber2);}
+</style>
+</head>
+<body>
+<div id="header">
+  <div id="logo">
+    <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#f59e0b" stroke-width="2">
+      <path d="M12 2L2 7l10 5 10-5-10-5z"/><path d="M2 17l10 5 10-5"/><path d="M2 12l10 5 10-5"/>
+    </svg>
+    MES DASHBOARD
+  </div>
+  <div id="status-bar">
+    <span id="ws-dot"></span>
+    <span id="ws-label">DISCONNECTED</span>
+    <span id="last-update">WAITING FOR DATA...</span>
+  </div>
+</div>
+
+<div id="content">
+  <div class="conn-form">
+    <span style="font-size:11px;color:var(--text3);letter-spacing:1px;">MQTT BROKER (WS)</span>
+    <input class="conn-input" id="inp-host" value="localhost"/>
+    <input class="conn-input" id="inp-port" value="9001" style="width:70px"/>
+    <button class="conn-btn" id="btn-connect" onclick="connectMQTT()">CONNECT</button>
+  </div>
+
+  <div class="kpi-row">
+    <div class="kpi-card" style="border-color:#38bdf833">
+      <div class="kpi-val" style="color:var(--blue)" id="kpi-orders">0</div>
+      <div class="kpi-sub">TOTAL ORDERS</div>
+    </div>
+    <div class="kpi-card" style="border-color:#a78bfa33">
+      <div class="kpi-val" style="color:var(--purple)" id="kpi-pieces">0</div>
+      <div class="kpi-sub">PIECES PRODUCED</div>
+    </div>
+    <div class="kpi-card" style="border-color:#4ade8033">
+      <div class="kpi-val" style="color:var(--green)">
+        <span id="kpi-w1">0</span> / <span id="kpi-w2">0</span>
+      </div>
+      <div class="kpi-sub">WAREHOUSE (W1/W2)</div>
+    </div>
+    <div class="kpi-card" style="border-color:#f59e0b33">
+      <div class="kpi-val" style="color:var(--amber)" id="kpi-cost">0.00€</div>
+      <div class="kpi-sub">TOTAL PRODUCTION COST</div>
+    </div>
+  </div>
+
+  <div style="display:grid;grid-template-columns:1.2fr 1fr;gap:20px;">
+    <!-- ORDERS -->
+    <div class="panel">
+      <div class="panel-title">Production Orders Status</div>
+      <table>
+        <thead>
+          <tr>
+            <th>ORDER ID</th>
+            <th>TOTAL PIECES</th>
+            <th>PRODUCED</th>
+            <th>PENDING</th>
+            <th>PROGRESS</th>
+            <th>COST</th>
+          </tr>
+        </thead>
+        <tbody id="orders-body">
+          <tr><td colspan="6" style="text-align:center;color:var(--text3)">No orders</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <!-- CELL STATS -->
+    <div class="panel">
+      <div class="panel-title">Shop Floor Statistics</div>
+      <div class="chart-wrap"><canvas id="cellChart"></canvas></div>
+    </div>
+  </div>
+</div>
+
+<script>
+let mqttClient = null;
+let cellChart = null;
+
+function setStatus(cls, text) {
+  document.getElementById('ws-dot').className = cls;
+  document.getElementById('ws-label').className = cls;
+  document.getElementById('ws-label').textContent = text;
+}
+
+function connectMQTT() {
+  const host = document.getElementById('inp-host').value;
+  const port = parseInt(document.getElementById('inp-port').value);
+  const clientId = "MES_GUI_" + Math.random().toString(16).substr(2, 8);
+  
+  setStatus('error', 'CONNECTING...');
+  mqttClient = new Paho.MQTT.Client(host, port, clientId);
+  
+  mqttClient.onConnectionLost = (responseObj) => {
+    setStatus('error', 'DISCONNECTED');
+    console.log("Connection Lost:", responseObj.errorMessage);
+  };
+  
+  mqttClient.onMessageArrived = (message) => {
+    try {
+      const p = JSON.parse(message.payloadString);
+      if (p.type === "dashboard_update") {
+        updateDashboard(p);
+      }
+    } catch(e) { console.error(e); }
+  };
+  
+  mqttClient.connect({
+    onSuccess: () => {
+      setStatus('live', 'CONNECTED');
+      document.getElementById('btn-connect').textContent = 'RECONNECT';
+      mqttClient.subscribe("factory/mes/#");
+    },
+    onFailure: (err) => {
+      setStatus('error', 'FAILED TO CONNECT');
+      console.log("Connect failed", err);
+    }
+  });
+}
+
+function updateDashboard(data) {
+  document.getElementById('last-update').textContent = `LAST UPDATE: ${new Date().toLocaleTimeString()}`;
+  
+  // Update Warehouses
+  document.getElementById('kpi-w1').textContent = data.warehouse.w1;
+  document.getElementById('kpi-w2').textContent = data.warehouse.w2;
+
+  // Update Orders Table
+  const tbody = document.getElementById('orders-body');
+  if (!data.orders || data.orders.length === 0) {
+    tbody.innerHTML = '<tr><td colspan="6" style="text-align:center;color:var(--text3)">No pending orders</td></tr>';
+  } else {
+    let totalPieces = 0;
+    let totalCost = 0;
+    tbody.innerHTML = data.orders.map(o => {
+      totalPieces += parseInt(o.produced || 0);
+      totalCost += parseFloat(o.total_cost || 0);
+      const produced = parseInt(o.produced || 0);
+      const total = parseInt(o.total_pieces || 1);
+      const pending = parseInt(o.pending || 0);
+      const cost = parseFloat(o.total_cost || 0).toFixed(2);
+      const pct = (produced / total) * 100;
+      
+      return `<tr>
+        <td style="font-family:var(--font-mono);color:var(--text1)">ORD-${o.order_id}</td>
+        <td>${total}</td>
+        <td style="color:var(--green)">${produced}</td>
+        <td style="color:var(--red)">${pending}</td>
+        <td>
+          <div style="font-size:10px">${pct.toFixed(0)}%</div>
+          <div class="pct-bar"><div class="pct-fill" style="width:${pct}%"></div></div>
+        </td>
+        <td style="color:var(--amber)">${cost}€</td>
+      </tr>`;
+    }).join('');
+    
+    document.getElementById('kpi-orders').textContent = data.orders.length;
+    document.getElementById('kpi-pieces').textContent = totalPieces;
+    document.getElementById('kpi-cost').textContent = totalCost.toFixed(2) + "€";
+  }
+
+  // Update Chart (Cell times)
+  const cells = [1, 2, 3, 4];
+  const chartData = cells.map(c => {
+    const row = data.cell_times.find(x => x.cell === c);
+    return row ? parseFloat(row.total_time) : 0;
+  });
+
+  if (!cellChart) {
+    const ctx = document.getElementById('cellChart').getContext('2d');
+    cellChart = new Chart(ctx, {
+      type: 'bar',
+      data: {
+        labels: ['CELL 1', 'CELL 2', 'CELL 3', 'CELL 4'],
+        datasets: [{
+          label: 'Total Machine Time (seconds)',
+          data: chartData,
+          backgroundColor: 'rgba(56, 189, 248, 0.6)',
+          borderColor: '#38bdf8',
+          borderWidth: 1
+        }]
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        plugins: { legend: { display: false } },
+        scales: {
+          y: { 
+            beginAtZero: true, 
+            grid: { color: '#1f2937' },
+            ticks: { color: '#94a3b8' }
+          },
+          x: { 
+            grid: { color: '#1f2937' },
+            ticks: { color: '#94a3b8' }
+          }
+        }
+      }
+    });
+  } else {
+    cellChart.data.datasets[0].data = chartData;
+    cellChart.update();
+  }
+}
+
+// Auto-connect on load
+setTimeout(connectMQTT, 500);
+</script>
+</body>
+</html>
