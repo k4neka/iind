@@ -9,8 +9,9 @@ from config import (MQTT_BROKER, MQTT_PORT,
                     MQTT_TOPIC_MES_STATUS,
                     MQTT_TOPIC_MATERIAL_LOAD_WOOD,
                     MQTT_TOPIC_MATERIAL_LOAD_METAL,
-                    MQTT_TOPIC_MATERIAL_LOAD)
-from database import log_mes_status
+                    MQTT_TOPIC_MATERIAL_LOAD,
+                    BOM)
+from database import log_mes_status, update_inventory
 
 try:
     import paho.mqtt.client as mqtt
@@ -58,6 +59,32 @@ class MQTTBridge:
             log_mes_status(time.time(), msg.topic, payload)
         except Exception as e:
             print(f"[mqtt] on_message error: {e}")
+            return
+        self._sync_inventory(payload)
+
+    def _sync_inventory(self, raw_payload):
+        """Keep the ERP inventory table in lock-step with the plant.
+
+        Every COMPLETED piece the MES reports consumes its raw materials
+        (per BOM) and adds one finished product to stock. Together with
+        the raw-arrival update in dispatch_today, this is what makes the
+        inventory table reflect real stock instead of staying at 0.
+        """
+        try:
+            data = json.loads(raw_payload)
+        except Exception:
+            return
+        if data.get("status") != "COMPLETED":
+            return
+        piece = data.get("piece_type")
+        if not piece:
+            return
+        update_inventory(piece, 1)
+        for material, qty in BOM.get(piece, {}).items():
+            if qty > 0:
+                update_inventory(material, -qty)
+        print(f"[erp] inventory sync: +1 {piece}, consumed "
+              f"{ {m: q for m, q in BOM.get(piece, {}).items() if q > 0} }")
 
     def start(self):
         if self.client is None:

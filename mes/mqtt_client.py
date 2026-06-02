@@ -79,6 +79,19 @@ class MESMqtt:
             self._w1_local["Metal"] = int(metal)
             print(f"[w1] RESET to wood={wood} metal={metal}")
 
+    # ---- generic piece tracking (sub-parts staged via Transfer Cell) ----
+
+    def w1_add_piece(self, name, qty=1):
+        """Add an arbitrary piece type to the W1 model (e.g. a sub-part
+        RtopW/LegM brought back from W2 through the Transfer Cell)."""
+        with self._w1_lock:
+            self._w1_local[name] = self._w1_local.get(name, 0) + qty
+            print(f"[w1] +{qty} {name} (now {self._w1_local.get(name)})")
+
+    def w1_has(self, name, qty=1) -> bool:
+        with self._w1_lock:
+            return self._w1_local.get(name, 0) >= qty
+
     # ---- MQTT plumbing -------------------------------------------------
 
     def start(self):

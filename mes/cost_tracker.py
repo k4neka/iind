@@ -11,8 +11,11 @@ class CostTracker:
     compute occupancy cost, accumulate it into the piece, and (for the
     assembly/last machine) publish a COMPLETED event to the ERP."""
 
-    def __init__(self, mqtt_publish_status):
+    def __init__(self, mqtt_publish_status, on_completed=None):
         self.mqtt_publish_status = mqtt_publish_status
+        # Optional hook fired with the completed pending_pieces row, used
+        # to auto-route the finished product back to WH1.
+        self.on_completed = on_completed
         # _open[(cell, piece_id)] = entered_at (epoch seconds)
         self._open: dict[tuple[int, int], float] = {}
         # accumulated cost per (cell, piece_id) so far
@@ -60,6 +63,13 @@ class CostTracker:
                 "status":        "COMPLETED",
                 "real_cost":     round(total_cost, 2),
             })
+
+            # Auto-route the finished product back to WH1 via Transfer_Cell.
+            if self.on_completed:
+                try:
+                    self.on_completed(row)
+                except Exception as e:
+                    print(f"[cost] on_completed hook error: {e}")
 
     def sweep_stuck(self, now_ts: float):
         """Force-close machine occupancies that have been open too long.

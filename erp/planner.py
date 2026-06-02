@@ -15,13 +15,15 @@ import math
 from collections import defaultdict
 
 from config import (BOM, SUPPLIERS, MAX_UNLOAD_PER_DAY,
-                    WAREHOUSE_CAPACITY, PLANNING_HORIZON_DAYS)
+                    WAREHOUSE_CAPACITY, PLANNING_HORIZON_DAYS,
+                    BASELINE_STOCK)
+from time_model import estimate_production_days
 from database import (
     get_pending_order_lines, get_production_plan, get_purchase_plan,
     add_production_entry, add_purchase_entry,
     production_due_on, purchases_arriving_on,
     mark_production_dispatched, mark_purchase_placed,
-    save_penalty_cost, get_inventory,
+    save_penalty_cost, get_inventory, update_inventory,
 )
 
 
@@ -100,10 +102,125 @@ def _w1_occupancy_from_purchases(current_day: int):
 
 
 # ---------------------------------------------------------------------------
+# Supplier selection (cost optimisation)
+# ---------------------------------------------------------------------------
+
+def _choose_supplier(material: str, net_qty: int, days_slack: int):
+    """Pick the cheapest *feasible* supplier for `net_qty` of `material`.
+
+    Feasible = its lead time fits within `days_slack`. The comparison is
+    on TOTAL batch cost (after rounding up to the supplier's minimum
+    batch), not on raw unit price, so a cheap bulk supplier that forces a
+    large min-batch is only chosen when it actually wins on total cost.
+
+    Returns (supplier_name, info_dict, batch_qty, total_cost).
+    """
+    best = None
+    for name, table in SUPPLIERS.items():
+        info = table[material]
+        if days_slack < info["lead"]:
+            continue  # cannot arrive in time
+        batch = math.ceil(net_qty / info["min"]) * info["min"]
+        cost = batch * info["price"]
+        # Tie-break on smaller batch (less overstock), then name.
+        cand = (cost, batch, name, info)
+        if best is None or cand[:2] < best[:2]:
+            best = cand
+
+    if best is None:
+        # Nothing meets the deadline: fall back to the lowest-lead
+        # supplier so the order is only as late as unavoidable.
+        name = min(SUPPLIERS,
+                   key=lambda s: SUPPLIERS[s][material]["lead"])
+        info = SUPPLIERS[name][material]
+        batch = math.ceil(net_qty / info["min"]) * info["min"]
+        best = (batch * info["price"], batch, name, info)
+
+    cost, batch, name, info = best
+    return name, info, batch, cost
+
+
+def _choose_supplier_cost_benefit(material, net_qty, current_day,
+                                  prod_day, ddate, penalty_per_day,
+                                  prod_days):
+    """Pick the supplier minimising TOTAL cost = purchase + expected
+    late-delivery penalty.
+
+    A piece can only start production once its material has arrived, so
+    each supplier's lead time shifts the estimated completion day
+    (arrival + machine processing time). When that pushes completion past
+    `ddate`, the resulting penalty is charged against that supplier. This
+    is what lets the planner pay Supplier A's immediate-delivery premium
+    only when it actually saves more penalty than it costs — and take
+    Supplier B's cheaper price whenever the deadline still holds.
+
+    Returns (supplier, info, batch, purchase_cost, exp_penalty, days_late).
+    """
+    best = None
+    for name, table in SUPPLIERS.items():
+        info = table[material]
+        batch = math.ceil(net_qty / info["min"]) * info["min"]
+        purchase = batch * info["price"]
+        arrival_day = max(prod_day, current_day + info["lead"])
+        completion_day = arrival_day + prod_days
+        days_late = max(0, completion_day - ddate)
+        penalty = days_late * penalty_per_day
+        total = purchase + penalty
+        cand = (total, purchase, batch, name, info, penalty, days_late)
+        if best is None or cand[0] < best[0]:
+            best = cand
+    total, purchase, batch, name, info, penalty, days_late = best
+    return name, info, batch, purchase, penalty, days_late
+
+
+# ---------------------------------------------------------------------------
+# Predictive pre-ordering
+# ---------------------------------------------------------------------------
+
+def ensure_baseline_stock(current_day: int):
+    """Keep a baseline raw-material buffer in W1 regardless of orders.
+
+    Reactive purchasing only fires once a client order exists, which adds
+    a full supplier lead time before production can start. This pre-orders
+    wood and metal up to BASELINE_STOCK so a buffer is always on hand.
+
+    Counts live inventory PLUS purchases already in flight (placed=FALSE)
+    so repeated calls don't stack duplicate buffer orders. Tops up any
+    deficit from the cheapest supplier.
+    """
+    stock = _current_raw_inventory()
+    inflight = defaultdict(int)
+    for p in get_purchase_plan():
+        if not p["placed"] and p["material"] in BASELINE_STOCK:
+            inflight[p["material"]] += int(p["quantity"])
+
+    for material, target in BASELINE_STOCK.items():
+        have = stock.get(material, 0) + inflight[material]
+        deficit = target - have
+        if deficit <= 0:
+            continue
+
+        # Generous slack so the cheap bulk supplier is eligible: a buffer
+        # has no hard deadline, we just want it cheap.
+        supplier, info, batch, cost = _choose_supplier(
+            material, deficit, days_slack=PLANNING_HORIZON_DAYS)
+        arrival_day = current_day + info["lead"]
+        order_day = current_day
+        add_purchase_entry(order_day, arrival_day, supplier,
+                           material, batch, cost)
+        print(f"[plan] pre-order baseline: {batch} {material} from "
+              f"{supplier} (arrives day {arrival_day}, cost {cost:.2f}€, "
+              f"deficit was {deficit})")
+
+
+# ---------------------------------------------------------------------------
 # Main planner
 # ---------------------------------------------------------------------------
 
 def replan(current_day: int):
+    # Predictive buffer first, so it runs even with no client orders.
+    ensure_baseline_stock(current_day)
+
     pending = get_pending_order_lines()
     if not pending:
         return
@@ -123,6 +240,9 @@ def replan(current_day: int):
     stock_remaining = dict(raw_stock)
 
     demand: dict[tuple, int] = defaultdict(int)
+    # Per-(prod_day, material) deadline/penalty/production-time context so
+    # the second pass can run the cost-benefit supplier decision.
+    demand_meta: dict[tuple, dict] = {}
     prod_entries: list[tuple] = []
 
     # -----------------------------------------------------------------
@@ -173,7 +293,16 @@ def replan(current_day: int):
                 )
                 net_needed = qty_needed - from_stock
                 if net_needed > 0:
-                    demand[(prod_day, material)] += net_needed
+                    key = (prod_day, material)
+                    demand[key] += net_needed
+                    meta = demand_meta.setdefault(
+                        key, {"ddate": ddate, "penalty": 0.0,
+                              "prod_days": 0})
+                    meta["ddate"] = min(meta["ddate"], ddate)
+                    meta["penalty"] = max(meta["penalty"], penalty)
+                    meta["prod_days"] = max(
+                        meta["prod_days"],
+                        estimate_production_days(piece))
 
             prod_entries.append((prod_day, piece, line_id))
 
@@ -214,22 +343,20 @@ def replan(current_day: int):
                 continue
             prod_day = shifted
 
-        info_a = SUPPLIERS["SupplierA"][material]
-        info_b = SUPPLIERS["SupplierB"][material]
-        days_slack = prod_day - current_day
-
-        use_b = ((net_qty >= info_b["min"])
-                 and (days_slack >= info_b["lead"]))
-        if use_b:
-            supplier, info = "SupplierB", info_b
+        meta = demand_meta.get((prod_day, material))
+        if meta:
+            (supplier, info, batch, cost,
+             exp_penalty, days_late) = _choose_supplier_cost_benefit(
+                material, net_qty, current_day, prod_day,
+                meta["ddate"], meta["penalty"], meta["prod_days"])
         else:
-            supplier, info = "SupplierA", info_a
+            days_slack = prod_day - current_day
+            supplier, info, batch, cost = _choose_supplier(
+                material, net_qty, days_slack)
+            exp_penalty, days_late = 0.0, 0
 
-        min_q = info["min"]
-        batch = math.ceil(net_qty / min_q) * min_q
-        arrival_day = prod_day
+        arrival_day = max(prod_day, current_day + info["lead"])
         order_day = max(current_day, arrival_day - info["lead"])
-        cost = batch * info["price"]
         add_purchase_entry(order_day, arrival_day, supplier,
                            material, batch, cost)
 
@@ -237,7 +364,9 @@ def replan(current_day: int):
         w1_proj[arrival_day] += batch
         print(f"[plan] purchase: {batch} {material} from {supplier} "
               f"(order day {order_day}, arrives day {arrival_day}, "
-              f"cost {cost:.2f}€, net_demand={net_qty})")
+              f"cost {cost:.2f}€, net_demand={net_qty}; "
+              f"cost-benefit: exp_penalty={exp_penalty:.2f}€, "
+              f"days_late={days_late})")
 
     # -----------------------------------------------------------------
     # Commit production entries.
@@ -291,8 +420,12 @@ def dispatch_today(current_day: int, mqtt_bridge):
 
     arrivals = purchases_arriving_on(current_day)
     for p in arrivals:
+        # Raw material physically lands in W1 today: reflect it in the
+        # inventory table so the ERP DB stops reading 0.
+        update_inventory(p["material"], int(p["quantity"]))
         print(f"[dispatch] day {current_day}: sending material_load "
-              f"{p['quantity']} {p['material']} to MES")
+              f"{p['quantity']} {p['material']} to MES "
+              f"(W1 inventory updated)")
         mqtt_bridge.send_material_load_command(p["material"],
                                                p["quantity"])
     if arrivals:

@@ -33,9 +33,27 @@ DB_CONFIG = {
 SECONDS_PER_DAY       = 60
 PLANNING_HORIZON_DAYS = 30
 
+# --- Production time model (cost-benefit estimation) ---
+# Used by time_model.estimate_production_seconds to decide whether a
+# cheaper-but-slower supplier would push a piece past its deadline.
+TOOL_CHANGE_TIME_S = 30    # changing between any two tools (PDF §2)
+TRANSFER_TIME_S    = 5     # moving a piece one hop in a clear cell
+CELL_HOPS          = 6     # Wout->M1->T1->M2->T2->M3->Win
+QUEUE_FACTOR       = 1.5   # inflate transfer time when the line is busy
+
 # --- Plant limits ---
 WAREHOUSE_CAPACITY = 32
 MAX_UNLOAD_PER_DAY = 30
+
+# --- Predictive pre-ordering (buffer stock) ---
+# Baseline raw-material buffer the ERP keeps in W1 at all times,
+# independent of client orders, so production can start the instant an
+# order arrives. Values are sized to the cheap bulk-supplier minimum
+# batches (Wood>=12, Metal>=8) and stay within WAREHOUSE_CAPACITY.
+BASELINE_STOCK = {
+    "Wood":  12,
+    "Metal": 8,
+}
 
 # --- Suppliers ---
 SUPPLIERS = {

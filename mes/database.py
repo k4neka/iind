@@ -137,6 +137,20 @@ def mark_completed(piece_pk, real_cost):
         conn.commit()
 
 
+def piece_type_by_id(piece_pk):
+    """Return the piece_type (e.g. 'RWM') for a pending_pieces row id.
+
+    Used by the completion buffer consumer: the PLC g_Done buffer carries
+    the ParentID (= this row id), and we must report the FINAL product type
+    to the ERP, not the shaped-top InitPiece (which would wrongly log a
+    'RtopW' completion instead of 'RWM')."""
+    with get_conn() as conn:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute("SELECT piece_type, order_id, order_line_id "
+                    "FROM pending_pieces WHERE id=%s", (piece_pk,))
+        return cur.fetchone()
+
+
 def in_progress_by_initpiece(init_piece_id, cell):
     with get_conn() as conn:
         cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
