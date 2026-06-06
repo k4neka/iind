@@ -2,7 +2,7 @@
 import os
 
 # --- Networking ---
-TCP_HOST = "127.0.0.1"
+TCP_HOST = "0.0.0.0"
 TCP_PORT = 6666
 
 MQTT_BROKER = os.getenv("MQTT_BROKER", "localhost")
@@ -11,7 +11,7 @@ MQTT_PORT   = int(os.getenv("MQTT_PORT", 1883))
 # Tópicos alinhados com o MES (prefixo factory/)
 MQTT_TOPIC_PRODUCTION  = "factory/erp/production_orders"
 MQTT_TOPIC_DELIVERY    = "factory/erp/delivery_orders"
-MQTT_TOPIC_PURCHASE    = "factory/erp/purchase_orders"
+MQTT_TOPIC_END_OF_DAY  = "factory/erp/end_of_day"
 MQTT_TOPIC_MES_STATUS  = "factory/mes/status"
 
 # Material load: um tópico distinto por material para evitar colisão de retain

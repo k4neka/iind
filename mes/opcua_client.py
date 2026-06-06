@@ -4,28 +4,24 @@ import datetime
 from asyncua import Client, ua
 
 from config import (OPCUA_URL_PRIMARY, OPCUA_URL_FALLBACK,
-                    OPCUA_NS, OPCUA_PREFIX, REG_SIZE, LOADER_BATCH_SIZE)
+                    OPCUA_NS, OPCUA_PREFIX, LOADER_BATCH_SIZE)
 
 
-# Transfer_Cell I/O offsets, from PLC_PRG:
-#   Transfer: Transfer_Cell(20, 45, 14, ... 10, 24, 0)
-#   -> Wout sensor In[20], Wout request register Reg[14]; Win sensor In[10].
-# These reflect the *physical* corridor and are reliable to read (unlike
-# g_W1_Count / g_W2_Count, which the current PLC project leaves at 0).
-TRANSFER_WOUT_IN = 20    # piece present at the corridor entrance (W2 side)
-TRANSFER_WOUT_REG = 14   # piece id the corridor Wout is requesting from W2
-TRANSFER_WIN_IN = 10     # piece present at the corridor exit (W1 side)
-# Seconds to let the piece finish travelling the 5 corridor conveyors into
-# W1 once it has been pulled out of W2. Generous; the assembly step also
-# self-synchronises (its cell Wout waits for the piece in W1).
-CORRIDOR_SETTLE_S = 6.0
+# The MES no longer drives the Transfer_Cell corridor (v3 Bug 6): finished
+# goods stay in W2 and the complex-piece top transfer is handled PLC-side by
+# the Router. The corridor handshake helpers were removed accordingly.
 
 
 class PLCClient:
-    def __init__(self):
+    def __init__(self, on_reconnect=None):
         self.client: Client | None = None
         # Cached working VariantType for the CODESYS TIME field OpTime.
         self._optime_variant = None
+        # Called after a *re*connect (not the first connect) so callers can
+        # discard PLC-derived state — e.g. ToolStateTracker.reset(), since a
+        # PLC restart returns every machine to its startup tool.
+        self._on_reconnect = on_reconnect
+        self._connected_before = False
 
     async def connect(self) -> bool:
         for url in (OPCUA_URL_PRIMARY, OPCUA_URL_FALLBACK):
@@ -35,6 +31,13 @@ class PLCClient:
                 await c.connect()
                 self.client = c
                 print(f"[opcua] connected to {url}")
+                if self._connected_before and self._on_reconnect:
+                    try:
+                        self._on_reconnect()
+                        print("[opcua] reconnect: tool state reset")
+                    except Exception as e:
+                        print(f"[opcua] on_reconnect hook failed: {e}")
+                self._connected_before = True
                 return True
             except Exception as e:
                 print(f"[opcua] failed {url}: {e}")
@@ -75,38 +78,28 @@ class PLCClient:
         return False
 
     # ---- high-level reads ---------------------------------------------------
-    async def read_reg(self) -> list[int]:
-        return [await self.read(f"Reg[{i}]") for i in range(REG_SIZE)]
+    async def read_w1_counts(self) -> dict:
+        """Read the PLC's authoritative raw-material counters in W1.
+
+        GVL exposes `W1Count : ARRAY[1..2] OF UINT` where index 1 = Wood and
+        index 2 = Metal (the WarehouseOut Receive_Workpiece_Data action
+        decrements W1Count[InitPiece] as each raw piece leaves W1). This is
+        now the single source of truth for how much Wood/Metal is physically
+        in W1 — the MES no longer has to guess from dispatch bookkeeping.
+        Returns {'Wood': n, 'Metal': m}; on any read error returns None so
+        the caller keeps its previous estimate instead of zeroing it.
+        """
+        try:
+            wood  = int(await self.read("W1Count[1]"))
+            metal = int(await self.read("W1Count[2]"))
+            return {"Wood": wood, "Metal": metal}
+        except Exception as e:
+            print(f"[opcua] read_w1_counts failed: {e}")
+            return None
 
     async def read_w1_count(self) -> int:
-        try:
-            return int(await self.read("g_W1_Count"))
-        except Exception as e:
-            print(f"[opcua] read_w1_count failed: {e}")
-            return 0
-
-    async def read_w2_count(self) -> int:
-        try:
-            return int(await self.read("g_W2_Count"))
-        except Exception as e:
-            print(f"[opcua] read_w2_count failed: {e}")
-            return 0
-
-    async def read_in(self, i: int) -> bool:
-        """Read one physical input sensor GVL.In[i]."""
-        try:
-            return bool(await self.read(f"In[{i}]"))
-        except Exception as e:
-            print(f"[opcua] read In[{i}] failed: {e}")
-            return False
-
-    async def read_reg_index(self, i: int) -> int:
-        """Read one warehouse request register GVL.Reg[i]."""
-        try:
-            return int(await self.read(f"Reg[{i}]"))
-        except Exception as e:
-            print(f"[opcua] read Reg[{i}] failed: {e}")
-            return 0
+        c = await self.read_w1_counts()
+        return (c["Wood"] + c["Metal"]) if c else 0
 
     async def cell_free(self, cell: int) -> bool:
         return bool(await self.read(f"Cell_{cell}_Top_Status.free_cmd"))
@@ -143,17 +136,10 @@ class PLCClient:
         else:
             print("[opcua] WARN: Router intake busy; sending route anyway")
 
-        # 2. Write the route.
-        await self._write_workpiece_struct(base, init_piece, operations)
-        for field, val in (("PieceID", piece_id), ("ParentID", parent_id)):
-            try:
-                await self.write(f"{base}.{field}", int(val),
-                                 ua.VariantType.Int16)
-            except Exception as e:
-                print(f"[opcua] WRITE FAILED at {base}.{field} = {val}: "
-                      f"{type(e).__name__}: {e}  -> check this struct field "
-                      f"exists and OPC-UA symbols were regenerated")
-                raise
+        # 2. Write the route (InitPiece, ops, PieceID, ParentID).
+        await self._write_workpiece_struct(base, init_piece, operations,
+                                           piece_id=piece_id,
+                                           parent_id=parent_id)
 
         # 3. Raise recv_cmd: the route is offered.
         await self.write("g_Router_Order.recv_cmd", True,
@@ -201,11 +187,19 @@ class PLCClient:
 
     # ---- cell handshake -----------------------------------------------------
     async def _write_workpiece_struct(self, base: str, init_piece: int,
-                                      operations: list[dict]):
+                                      operations: list[dict],
+                                      piece_id: int = 0, parent_id: int = 0):
         """Write a full Workpiece_T at `base` (e.g.
-        'Cell_3_Top_Order.Workpiece'): InitPiece, Next/Last_Operation and
-        every Operation. Each op field defaults to 0 if absent. Does NOT
-        touch recv_cmd.
+        'Cell_3_Top_Order.Workpiece'): InitPiece, Next/Last_Operation,
+        every Operation, and PieceID/ParentID. Each op field defaults to 0
+        if absent. Does NOT touch recv_cmd.
+
+        PieceID/ParentID drive the PLC completion buffer (g_Done): the M3
+        Inc_Next_Oper action sets PieceID := ParentID, and Store_Piece_Ack
+        writes a g_Done entry once a piece's ops are exhausted at a cell Win
+        **and ParentID > 0**. Simple pieces now pass a non-zero ParentID
+        (their pending_pieces.id) so they complete through g_Done exactly
+        like complex pieces; leave both 0 for transport-only workpieces.
 
         Each write is individually guarded so a failure names the exact node
         that rebented, instead of a generic 'Failed to send request'."""
@@ -220,6 +214,8 @@ class PLCClient:
         await _w(f"{base}.InitPiece", int(init_piece))
         await _w(f"{base}.Next_Operation", 0)
         await _w(f"{base}.Last_Operation", max(0, len(operations) - 1))
+        await _w(f"{base}.PieceID", int(piece_id))
+        await _w(f"{base}.ParentID", int(parent_id))
         for i, op in enumerate(operations[:11]):
             ob = f"{base}.Operations[{i}]"
             await _w(f"{ob}.Cell",    int(op.get("cell", 0)))
@@ -241,14 +237,16 @@ class PLCClient:
                 raise
 
     async def write_workpiece(self, cell: int, init_piece: int,
-                              operations: list[dict]):
+                              operations: list[dict],
+                              piece_id: int = 0, parent_id: int = 0):
         """Populate Cell_X_Top_Order.Workpiece and raise recv_cmd.
 
         Caller is responsible for closing the handshake (lowering recv_cmd
         once the cell drops free_cmd, then waiting for it to rise again).
         """
         await self._write_workpiece_struct(
-            f"Cell_{cell}_Top_Order.Workpiece", init_piece, operations)
+            f"Cell_{cell}_Top_Order.Workpiece", init_piece, operations,
+            piece_id=piece_id, parent_id=parent_id)
         await self.write(f"Cell_{cell}_Top_Order.recv_cmd",
                          True, ua.VariantType.Boolean)
 
@@ -261,18 +259,24 @@ class PLCClient:
     # ---- blocking handshakes (used by orchestrators) -----------------------
     async def send_workpiece_handshake(self, cell: int, init_piece: int,
                                        operations: list[dict],
+                                       piece_id: int = 0, parent_id: int = 0,
                                        timeout: float = 60.0) -> bool:
         """Full single-piece handshake into a cell, mirroring the
         Order_generator step pattern: wait the cell head free -> write the
         workpiece + recv_cmd -> wait the cell accepts it (free_cmd drops)
         -> lower recv_cmd -> wait the head is ready again. Returns True on
-        success."""
+        success.
+
+        `parent_id` > 0 routes the piece's completion through the g_Done
+        buffer (used for simple final products; legs pass a unique
+        `piece_id` with the product's id as `parent_id`)."""
         if not await self._wait_until(lambda: self.cell_free(cell), timeout):
             print(f"[opcua] handshake Cell_{cell}: never free")
             return False
 
         await self.write_workpiece(cell=cell, init_piece=init_piece,
-                                   operations=operations)
+                                   operations=operations,
+                                   piece_id=piece_id, parent_id=parent_id)
 
         if not await self._wait_until(lambda: self.cell_busy(cell), timeout):
             print(f"[opcua] handshake Cell_{cell}: free_cmd never dropped")
@@ -285,115 +289,6 @@ class PLCClient:
         # here: the next handshake re-checks free at its start anyway.
         await self._wait_until(lambda: self.cell_free(cell), timeout)
         return True
-
-    async def _transfer_snapshot(self) -> dict:
-        """Read every signal that reflects the corridor, for detection and
-        diagnostics. g_W1/g_W2 are included but are unreliable in the
-        current PLC project (they stay 0); In[]/Reg[] are authoritative."""
-        return {
-            "w1": await self.read_w1_count(),
-            "w2": await self.read_w2_count(),
-            "wout_in": await self.read_in(TRANSFER_WOUT_IN),
-            "win_in": await self.read_in(TRANSFER_WIN_IN),
-            "wout_reg": await self.read_reg_index(TRANSFER_WOUT_REG),
-        }
-
-    # ---- Transfer_Order helpers (corridor handshake, mirrors a cell) -------
-    async def _transfer_free(self) -> bool:
-        return bool(await self.read("Transfer_Status.free_cmd"))
-
-    async def _transfer_cmd(self) -> bool:
-        return bool(await self.read("Transfer_Cmd"))
-
-    async def _transfer_done(self) -> bool:
-        return bool(await self.read("Transfer_Done"))
-
-    async def transfer_piece_blocking(self, piece_id: int,
-                                      ready_timeout: float = 180.0,
-                                      deliver_timeout: float = 60.0) -> bool:
-        """Return one piece from W2 to W1 through the Transfer_Cell.
-
-        This reproduces, over OPC-UA, the exact corridor handshake the
-        Order_generator used (steps 0/3/30/31), now that we know the gate
-        signals are produced *natively* by the PLC inside
-        WarehouseIn_Conveyor.Warehouse_Store_Piece:
-
-            * when ANY piece reaches W2 (a Win with Qoff <> 24), and
-              Transfer_Activate is TRUE, the PLC raises Transfer_Cmd.
-            * when a piece reaches W1 through the corridor (the corridor's
-              Win, Qoff = 24), the PLC raises Transfer_Done.
-
-        So the MES must (a) arm the corridor by setting Transfer_Activate,
-        (b) wait for Transfer_Cmd (proof the piece is physically in W2 — no
-        premature fire), (c) issue the Transfer_Order workpiece + recv_cmd
-        and clear Transfer_Cmd, (d) lower recv_cmd, (e) wait Transfer_Done
-        (piece delivered to W1), (f) disarm Transfer_Activate. This is the
-        decisive fix: the previous version never set Transfer_Activate, so
-        the PLC never raised Transfer_Cmd and the piece froze in W2.
-
-        `piece_id` is the piece TYPE requested out of W2 (InitPiece: RtopW=3
-        for a complex top, or the final-product id for a finished-goods
-        return). The corridor's WarehouseOut writes this into Reg[14] to
-        pull the matching piece out of W2.
-        """
-        s0 = await self._transfer_snapshot()
-        print(f"[opcua] transfer: requesting piece {piece_id} W2->W1 "
-              f"(In[20]={s0['wout_in']} Reg[14]={s0['wout_reg']} "
-              f"In[10]={s0['win_in']})")
-
-        # 0. Arm the corridor and clear stale latches. With Transfer_Activate
-        #    TRUE, the W2 Win will raise Transfer_Cmd when the piece arrives.
-        await self.write("Transfer_Done", False, ua.VariantType.Boolean)
-        await self.write("Transfer_Cmd", False, ua.VariantType.Boolean)
-        await self.write("Transfer_Activate", True, ua.VariantType.Boolean)
-
-        try:
-            # 1. Corridor head must be free, and the piece must have reached
-            #    W2 (Transfer_Cmd). This is the gate that was missing.
-            async def ready():
-                return await self._transfer_cmd() and await self._transfer_free()
-
-            if not await self._wait_until(ready, ready_timeout):
-                snap = await self._transfer_snapshot()
-                cmd = await self._transfer_cmd()
-                print(f"[opcua] transfer {piece_id}: not ready within "
-                      f"{ready_timeout:.0f}s (Transfer_Cmd={cmd}; piece may "
-                      f"not have reached W2). signals={snap}")
-                return False
-
-            # 2. Issue the transport-only workpiece (InitPiece = piece_id, no
-            #    operations) and raise recv_cmd; clear Transfer_Cmd, exactly
-            #    like Order_generator step 30.
-            await self._write_workpiece_struct(
-                "Transfer_Order.Workpiece", piece_id, operations=[])
-            await self.write("Transfer_Order.recv_cmd", True,
-                             ua.VariantType.Boolean)
-            await self.write("Transfer_Cmd", False, ua.VariantType.Boolean)
-
-            # 3. Lower recv_cmd (step 31) and wait for delivery to W1, which
-            #    the PLC signals by raising Transfer_Done at the corridor Win.
-            await self.write("Transfer_Order.recv_cmd", False,
-                             ua.VariantType.Boolean)
-
-            if not await self._wait_until(self._transfer_done,
-                                          deliver_timeout):
-                snap = await self._transfer_snapshot()
-                print(f"[opcua] transfer {piece_id}: Transfer_Done never "
-                      f"raised within {deliver_timeout:.0f}s. signals={snap}")
-                return False
-
-            # Let the piece settle into W1 before the next transfer engages.
-            await asyncio.sleep(CORRIDOR_SETTLE_S)
-            print(f"[opcua] transfer: piece {piece_id} delivered to W1")
-            return True
-        finally:
-            # Disarm and clear latches so the next transfer re-arms cleanly,
-            # mirroring Order_generator step 31 (Transfer_Activate := FALSE).
-            await self.write("Transfer_Order.recv_cmd", False,
-                             ua.VariantType.Boolean)
-            await self.write("Transfer_Done", False, ua.VariantType.Boolean)
-            await self.write("Transfer_Cmd", False, ua.VariantType.Boolean)
-            await self.write("Transfer_Activate", False, ua.VariantType.Boolean)
 
     # ---- OpTime VariantType probing ----------------------------------------
     async def _write_optime(self, node_path: str, op_time_s: float):
@@ -447,6 +342,140 @@ class PLCClient:
         else:
             await node.write_value(ua.DataValue(ua.Variant(int(ms), vt)))
 
+    # ---- Unloading docks (PDF §2.4 / §4.1) ---------------------------------
+    # The PLC exposes 5 Unloading_Dock FBs gated PLC-side by the addressed
+    # dock id, so the MES drives a single scalar request slot:
+    #   fill:      g_Unloader_DockID / g_Unloader_PieceID / g_Unloader_Qty
+    #              + rising edge on g_Unloader_Exec
+    #   discharge: g_Unloader_DischargeDockID / g_Unloader_DischargeQty
+    #              + rising edge on g_Unloader_DischargeExec
+    # Occupancy is read back from g_Unloader_DockCount[1..5]. Each FB latches
+    # its command on a rising edge, so every request is a clean FALSE->TRUE
+    # pulse with the scalars written FIRST, and we serialise one request at a
+    # time (the slot is shared by all 5 docks).
+
+    async def read_dock_count(self, dock: int) -> int:
+        """Occupancy of one dock (1..5) from g_Unloader_DockCount."""
+        try:
+            return int(await self.read(f"g_Unloader_DockCount[{dock}]"))
+        except Exception as e:
+            print(f"[opcua] read_dock_count({dock}) failed: {e}")
+            return 0
+
+    async def read_all_dock_counts(self) -> dict:
+        """{dock: count} for docks 1..5."""
+        out = {}
+        for d in range(1, 6):
+            out[d] = await self.read_dock_count(d)
+        return out
+
+    async def unload_fill_dock(self, dock: int, piece_id: int, qty: int,
+                               timeout: float = 30.0) -> bool:
+        """Pull `qty` pieces of type `piece_id` out of W2 onto dock `dock`.
+
+        Rising-edge handshake matching the Unloading_Dock FB (RReq):
+          1. clear g_Unloader_Exec (unambiguous edge);
+          2. write DockID, PieceID, Qty;
+          3. raise g_Unloader_Exec;
+          4. wait until g_Unloader_DockCount[dock] rose by `qty`;
+          5. drop g_Unloader_Exec.
+
+        Returns True if the dock occupancy reached the expected target within
+        `timeout`. The dock count is the ground truth (the FB only accepts the
+        request when (current + qty) <= 6, so we also verify capacity here).
+        """
+        if qty <= 0:
+            return True
+        try:
+            before = await self.read_dock_count(dock)
+            if before + qty > 6:
+                print(f"[opcua] unload_fill_dock: dock {dock} cannot hold "
+                      f"{qty} more (has {before}/6)")
+                return False
+
+            await self.write("g_Unloader_Exec", False, ua.VariantType.Boolean)
+            await self.write("g_Unloader_DockID",  int(dock),
+                             ua.VariantType.Int16)
+            await self.write("g_Unloader_PieceID", int(piece_id),
+                             ua.VariantType.Int16)
+            await self.write("g_Unloader_Qty",     int(qty),
+                             ua.VariantType.Int16)
+            await self.write("g_Unloader_Exec", True, ua.VariantType.Boolean)
+
+            target = before + qty
+            ok = await self._wait_until(
+                lambda: self._dock_at_least(dock, target), timeout)
+
+            await self.write("g_Unloader_Exec", False, ua.VariantType.Boolean)
+            if ok:
+                print(f"[opcua] dock {dock}: filled {qty}x piece {piece_id} "
+                      f"(now {await self.read_dock_count(dock)}/6)")
+            else:
+                print(f"[opcua] dock {dock}: fill timeout "
+                      f"(have {await self.read_dock_count(dock)}, "
+                      f"wanted {target})")
+            return ok
+        except Exception as e:
+            print(f"[opcua] unload_fill_dock({dock}) failed: {e}")
+            try:
+                await self.write("g_Unloader_Exec", False,
+                                 ua.VariantType.Boolean)
+            except Exception:
+                pass
+            return False
+
+    async def unload_discharge_dock(self, dock: int, qty: int | None = None,
+                                    timeout: float = 30.0) -> bool:
+        """Discharge (drop to the floor) pieces from dock `dock` at end-of-day.
+
+        If `qty` is None the whole dock is emptied (current occupancy). Rising
+        edge on g_Unloader_DischargeExec after writing the scalars; we then
+        wait for the dock count to fall to (before - qty).
+        """
+        try:
+            before = await self.read_dock_count(dock)
+            if before <= 0:
+                return True
+            q = before if qty is None else min(qty, before)
+
+            await self.write("g_Unloader_DischargeExec", False,
+                             ua.VariantType.Boolean)
+            await self.write("g_Unloader_DischargeDockID", int(dock),
+                             ua.VariantType.Int16)
+            await self.write("g_Unloader_DischargeQty", int(q),
+                             ua.VariantType.Int16)
+            await self.write("g_Unloader_DischargeExec", True,
+                             ua.VariantType.Boolean)
+
+            target = before - q
+            ok = await self._wait_until(
+                lambda: self._dock_at_most(dock, target), timeout)
+
+            await self.write("g_Unloader_DischargeExec", False,
+                             ua.VariantType.Boolean)
+            if ok:
+                print(f"[opcua] dock {dock}: discharged {q} "
+                      f"(now {await self.read_dock_count(dock)}/6)")
+            else:
+                print(f"[opcua] dock {dock}: discharge timeout "
+                      f"(have {await self.read_dock_count(dock)}, "
+                      f"wanted {target})")
+            return ok
+        except Exception as e:
+            print(f"[opcua] unload_discharge_dock({dock}) failed: {e}")
+            try:
+                await self.write("g_Unloader_DischargeExec", False,
+                                 ua.VariantType.Boolean)
+            except Exception:
+                pass
+            return False
+
+    async def _dock_at_least(self, dock: int, target: int) -> bool:
+        return (await self.read_dock_count(dock)) >= target
+
+    async def _dock_at_most(self, dock: int, target: int) -> bool:
+        return (await self.read_dock_count(dock)) <= target
+
     # ---- Loader -------------------------------------------------------------
     async def trigger_loader_batch(self, wood_qty: int, metal_qty: int):
         """Fire one batch (<= LOADER_BATCH_SIZE pieces) onto the Loader."""
@@ -474,10 +503,6 @@ class PLCClient:
                   f"metal={metal_qty}")
         except Exception as e:
             print(f"[opcua] trigger_loader_batch failed: {e}")
-
-    async def trigger_loader(self, wood_qty: int, metal_qty: int):
-        # Backwards-compat alias: single shot, no batching.
-        await self.trigger_loader_batch(wood_qty, metal_qty)
 
     async def trigger_loader_batched(self, wood_qty: int, metal_qty: int):
         """Split a large request into batches of LOADER_BATCH_SIZE pieces.
@@ -538,20 +563,3 @@ class PLCClient:
             await self.write("g_Loader_Exec", False, ua.VariantType.Boolean)
         except Exception as e:
             print(f"[opcua] clear_loader_exec failed: {e}")
-
-    # ---- Unloader -----------------------------------------------------------
-    async def trigger_unloader(self, piece_type: str, qty: int):
-        try:
-            await self.write("g_Unloader_PieceType", str(piece_type),
-                             ua.VariantType.String)
-            await self.write("g_Unloader_Qty", int(qty),
-                             ua.VariantType.Int16)
-            await self.write("g_Unloader_Exec", True, ua.VariantType.Boolean)
-            print(f"[opcua] trigger_unloader type={piece_type} qty={qty}")
-        except Exception as e:
-            print(f"[opcua] trigger_unloader failed: {e}")
-
-    # The W2->W1 return is driven as a full blocking handshake on
-    # Transfer_Order / Transfer_Status by transfer_piece_blocking() above.
-    # (g_Return_PieceID / g_Return_Exec are unused: no PLC program consumes
-    # them, so they never moved the corridor.)

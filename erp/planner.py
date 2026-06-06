@@ -1,29 +1,30 @@
 """MPS, production and purchasing planner + daily dispatcher.
 
-Fixes vs previous versions:
+Key behaviours:
 
-* ASAP scheduling: production is scheduled as early as possible
-  (current_day forward) so a 2-day-deadline order starts on day 0.
-* Inventory-aware purchasing: before placing a new purchase the planner
-  consults the live inventory table AND the unplaced rows already in
-  purchase_plan, so we never over-order.
-* W1 / W2 capacity respected: both warehouses are capped at
-  WAREHOUSE_CAPACITY at every planning day.
-* Purchase deduplication across repeated replan() calls.
+* ASAP scheduling: production is targeted at current_day so a tight order
+  starts immediately (material lead times are handled via purchase arrivals).
+* Urgency-ordered: pending lines are scheduled by descending slack-based
+  urgency; dispatch emits production orders in that order too.
+* Stock-first: finished goods on hand fulfil orders before new production,
+  guarded by stock_reservations against double-claiming.
+* Inventory-aware purchasing with a rolling W1 (<= 32) projection.
+* W2 is NOT tracked here — the MES is the authority on W2 occupancy.
 """
 import math
 from collections import defaultdict
 
 from config import (BOM, SUPPLIERS, MAX_UNLOAD_PER_DAY,
                     WAREHOUSE_CAPACITY, PLANNING_HORIZON_DAYS,
-                    BASELINE_STOCK)
-from time_model import estimate_production_days
+                    BASELINE_STOCK, FINAL_PRODUCTS)
+from time_model import expected_production_days
 from database import (
     get_pending_order_lines, get_production_plan, get_purchase_plan,
     add_production_entry, add_purchase_entry,
     production_due_on, purchases_arriving_on,
     mark_production_dispatched, mark_purchase_placed,
     save_penalty_cost, get_inventory, update_inventory,
+    reserve_stock, get_reserved, release_reservation,
 )
 
 
@@ -31,10 +32,9 @@ from database import (
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _empty_calendars(current_day: int):
+def _empty_unload_calendar(current_day: int):
     horizon = range(current_day, current_day + PLANNING_HORIZON_DAYS + 1)
-    return (defaultdict(int, {d: 0 for d in horizon}),
-            defaultdict(int, {d: 0 for d in horizon}))
+    return defaultdict(int, {d: 0 for d in horizon})
 
 
 def _existing_production_by_line():
@@ -43,16 +43,6 @@ def _existing_production_by_line():
         if r["order_line_id"] is None:
             continue
         out[r["order_line_id"]] += r["quantity"]
-    return out
-
-
-def _existing_purchases_unplaced():
-    """{(arrival_day, material): qty} for purchase rows still pending
-    (placed=FALSE). These are already committed."""
-    out = defaultdict(int)
-    for p in get_purchase_plan():
-        if not p["placed"]:
-            out[(p["arrival_day"], p["material"])] += p["quantity"]
     return out
 
 
@@ -74,85 +64,61 @@ def _pick_delivery_day(ddate, unload_occ, horizon_end):
     return day
 
 
-def _pick_production_day(delivery_day, w2_occ, current_day):
-    """Earliest day in [current_day, delivery_day] that respects W2
-    capacity for every day between prod_day and delivery_day."""
-    for prod_day in range(current_day, delivery_day + 1):
-        ok = all(w2_occ[d] < WAREHOUSE_CAPACITY
-                 for d in range(prod_day, delivery_day + 1))
-        if ok:
-            return prod_day
-    return None
+def _current_finished_inventory():
+    """Live finished-goods stock in W2 according to the inventory table
+    ({piece_type: qty} restricted to final products)."""
+    stock = {}
+    for row in get_inventory():
+        if row["piece_type"] in FINAL_PRODUCTS:
+            stock[row["piece_type"]] = int(row["quantity"])
+    return stock
 
 
-def _w1_occupancy_from_purchases(current_day: int):
-    """Project W1 occupancy by day across the horizon using purchases
-    already in the plan but not yet consumed. The model is simple:
-    arrivals add stock, but we don't yet know exact consumption days,
-    so we cap any single day."""
+def _project_w1_stock(current_day: int, current_inv: dict):
+    """Rolling projection of total W1 raw stock (Wood + Metal) per day across
+    the horizon (Item 4):
+
+        projected[d] = current raw inventory
+                     + Σ purchase arrivals on days <= d
+                     - Σ scheduled raw consumption on days <= d
+
+    Arrivals = purchase_plan rows with placed=FALSE; consumption = BOM raw of
+    undispatched production_plan rows (from_stock rows consume nothing). The
+    planner caps any purchase against this so projected W1 stays <= 32 every
+    day (fixes the purchases-only projection that could exceed 32)."""
     horizon_end = current_day + PLANNING_HORIZON_DAYS
-    occ = defaultdict(int)
+    base = current_inv.get("Wood", 0) + current_inv.get("Metal", 0)
+    stock = {d: base for d in range(current_day, horizon_end + 1)}
+
     for p in get_purchase_plan():
         if p["placed"]:
             continue
-        d = max(p["arrival_day"], current_day)
-        if d <= horizon_end:
-            occ[d] += int(p["quantity"])
-    return occ
+        d = max(int(p["arrival_day"]), current_day)
+        for day in range(d, horizon_end + 1):
+            stock[day] += int(p["quantity"])
+
+    for prod in get_production_plan():
+        if prod["dispatched"] or prod.get("from_stock"):
+            continue
+        raw = sum(BOM.get(prod["piece_type"], {}).values()) * int(prod["quantity"])
+        d = max(int(prod["sim_day"]), current_day)
+        for day in range(d, horizon_end + 1):
+            stock[day] -= raw
+
+    return stock
 
 
 # ---------------------------------------------------------------------------
 # Supplier selection (cost optimisation)
 # ---------------------------------------------------------------------------
 
-def _choose_supplier(material: str, net_qty: int, days_slack: int):
-    """Pick the cheapest *feasible* supplier for `net_qty` of `material`.
-
-    Feasible = its lead time fits within `days_slack`. The comparison is
-    on TOTAL batch cost (after rounding up to the supplier's minimum
-    batch), not on raw unit price, so a cheap bulk supplier that forces a
-    large min-batch is only chosen when it actually wins on total cost.
-
-    Returns (supplier_name, info_dict, batch_qty, total_cost).
-    """
-    best = None
-    for name, table in SUPPLIERS.items():
-        info = table[material]
-        if days_slack < info["lead"]:
-            continue  # cannot arrive in time
-        batch = math.ceil(net_qty / info["min"]) * info["min"]
-        cost = batch * info["price"]
-        # Tie-break on smaller batch (less overstock), then name.
-        cand = (cost, batch, name, info)
-        if best is None or cand[:2] < best[:2]:
-            best = cand
-
-    if best is None:
-        # Nothing meets the deadline: fall back to the lowest-lead
-        # supplier so the order is only as late as unavoidable.
-        name = min(SUPPLIERS,
-                   key=lambda s: SUPPLIERS[s][material]["lead"])
-        info = SUPPLIERS[name][material]
-        batch = math.ceil(net_qty / info["min"]) * info["min"]
-        best = (batch * info["price"], batch, name, info)
-
-    cost, batch, name, info = best
-    return name, info, batch, cost
-
-
-def _choose_supplier_cost_benefit(material, net_qty, current_day,
-                                  prod_day, ddate, penalty_per_day,
-                                  prod_days):
+def _choose_supplier_cost_benefit(material, net_qty, current_day, prod_day,
+                                  ddate, penalty_per_day, prod_days):
     """Pick the supplier minimising TOTAL cost = purchase + expected
-    late-delivery penalty.
-
-    A piece can only start production once its material has arrived, so
-    each supplier's lead time shifts the estimated completion day
-    (arrival + machine processing time). When that pushes completion past
-    `ddate`, the resulting penalty is charged against that supplier. This
-    is what lets the planner pay Supplier A's immediate-delivery premium
-    only when it actually saves more penalty than it costs — and take
-    Supplier B's cheaper price whenever the deadline still holds.
+    late-delivery penalty. Each supplier's lead shifts the completion day
+    (arrival + machine processing); when that passes `ddate` the penalty is
+    charged against it. This is what lets the planner pay SupplierA's premium
+    only when it actually saves more penalty than it costs.
 
     Returns (supplier, info, batch, purchase_cost, exp_penalty, days_late).
     """
@@ -173,49 +139,135 @@ def _choose_supplier_cost_benefit(material, net_qty, current_day,
     return name, info, batch, purchase, penalty, days_late
 
 
+def _choose_supplier(material, net_qty, current_day, prod_day, ddate,
+                     penalty_per_day, prod_days):
+    """Item 6 supplier pick: a single deadline-feasibility guard in front of
+    the (correct) cost-benefit function. If the cheap bulk SupplierB still
+    completes by the deadline, use it and skip the cost-benefit — this stops
+    paying SupplierA's premium unnecessarily. Otherwise fall back to the
+    cost-benefit comparison (which may pick A, or B late, whichever loses
+    least money).
+
+    Returns (supplier, info, batch, purchase_cost, exp_penalty, days_late).
+    """
+    b = SUPPLIERS["SupplierB"][material]
+    completion_b = current_day + b["lead"] + prod_days
+    if completion_b <= ddate:
+        batch = math.ceil(net_qty / b["min"]) * b["min"]
+        return "SupplierB", b, batch, batch * b["price"], 0.0, 0
+    return _choose_supplier_cost_benefit(
+        material, net_qty, current_day, prod_day, ddate,
+        penalty_per_day, prod_days)
+
+
 # ---------------------------------------------------------------------------
 # Predictive pre-ordering
 # ---------------------------------------------------------------------------
 
-def ensure_baseline_stock(current_day: int):
-    """Keep a baseline raw-material buffer in W1 regardless of orders.
-
-    Reactive purchasing only fires once a client order exists, which adds
-    a full supplier lead time before production can start. This pre-orders
-    wood and metal up to BASELINE_STOCK so a buffer is always on hand.
-
-    Counts live inventory PLUS purchases already in flight (placed=FALSE)
-    so repeated calls don't stack duplicate buffer orders. Tops up any
-    deficit from the cheapest supplier.
-    """
-    stock = _current_raw_inventory()
-    inflight = defaultdict(int)
+def _pending_inbound(material: str, by_day=None) -> int:
+    """Total raw `material` already on order (placed=FALSE), optionally only
+    counting tranches arriving on/before `by_day`. Used to avoid re-ordering
+    material a previous purchase (e.g. the baseline buffer) already covers
+    (v3 Bug 5)."""
+    total = 0
     for p in get_purchase_plan():
-        if not p["placed"] and p["material"] in BASELINE_STOCK:
-            inflight[p["material"]] += int(p["quantity"])
+        if p["material"] != material or p["placed"]:
+            continue
+        if by_day is None or int(p["arrival_day"]) <= by_day:
+            total += int(p["quantity"])
+    return total
 
+
+def _place_tranched(material, net_qty, current_day, horizon_end,
+                    ddate, penalty, prod_days, w1_proj, prefer_fast=False):
+    """Order `net_qty` of `material` in W1-sized tranches (v3 Bug 2).
+
+    A single oversized purchase (e.g. 36 wood) never fits W1 (cap 32) and the
+    old code just deferred it forever -> deadlock. Instead we split it into
+    min-batch tranches across days, each fitting the projected room, modelling
+    each tranche as consumed ~prod_days after arrival so production drains W1
+    and frees room for the next tranche. `w1_proj` (day -> projected stock) is
+    updated in place so successive tranches/materials see the committed ones.
+
+    `prefer_fast` picks the lowest-lead supplier (so the material lands as soon
+    as possible) instead of the cost-benefit choice — used for the baseline
+    buffer, whose whole purpose is instant availability."""
+    if prefer_fast:
+        name = min(SUPPLIERS, key=lambda s: SUPPLIERS[s][material]["lead"])
+        info = SUPPLIERS[name][material]
+        supplier = name
+    else:
+        supplier, info, _b, _c, _p, _l = _choose_supplier(
+            material, net_qty, current_day, current_day, ddate, penalty,
+            prod_days)
+    remaining = net_qty
+    day = current_day + info["lead"]
+    drain = max(1, int(prod_days))
+    guard = 0
+    while remaining > 0 and day <= horizon_end and guard < 500:
+        guard += 1
+        room = WAREHOUSE_CAPACITY - w1_proj.get(day, 0)
+        if room < info["min"]:
+            day += 1
+            continue
+        batches = min(room // info["min"], math.ceil(remaining / info["min"]))
+        tranche = batches * info["min"]
+        order_day = max(current_day, day - info["lead"])
+        add_purchase_entry(order_day, day, supplier, material, tranche,
+                           tranche * info["price"])
+        for d in range(day, horizon_end + 1):                 # arrival raises
+            w1_proj[d] = w1_proj.get(d, 0) + tranche
+        for d in range(min(horizon_end, day + drain), horizon_end + 1):  # drain
+            w1_proj[d] = w1_proj.get(d, 0) - tranche
+        print(f"[plan] purchase: {tranche} {material} from {supplier} "
+              f"(order day {order_day}, arrives day {day}, "
+              f"cost {tranche * info['price']:.2f}€, remaining {remaining - tranche})")
+        remaining -= tranche
+        day += 1
+    if remaining > 0:
+        print(f"[plan] WARN: {material}: {remaining} units unplaced this "
+              f"replan (W1 horizon full); will retry next replan")
+
+
+def ensure_baseline_stock(current_day: int):
+    """Keep a baseline raw-material buffer in W1 regardless of orders, so
+    production can start the instant an order arrives. Counts live inventory
+    PLUS purchases already in flight so repeated calls don't stack duplicates,
+    and orders the deficit in W1-sized tranches (v3 Bug 2)."""
+    stock = _current_raw_inventory()
+    horizon_end = current_day + PLANNING_HORIZON_DAYS
+    w1_proj = _project_w1_stock(current_day, stock)
     for material, target in BASELINE_STOCK.items():
-        have = stock.get(material, 0) + inflight[material]
+        have = stock.get(material, 0) + _pending_inbound(material)
         deficit = target - have
         if deficit <= 0:
             continue
-
-        # Generous slack so the cheap bulk supplier is eligible: a buffer
-        # has no hard deadline, we just want it cheap.
-        supplier, info, batch, cost = _choose_supplier(
-            material, deficit, days_slack=PLANNING_HORIZON_DAYS)
-        arrival_day = current_day + info["lead"]
-        order_day = current_day
-        add_purchase_entry(order_day, arrival_day, supplier,
-                           material, batch, cost)
-        print(f"[plan] pre-order baseline: {batch} {material} from "
-              f"{supplier} (arrives day {arrival_day}, cost {cost:.2f}€, "
-              f"deficit was {deficit})")
+        print(f"[plan] baseline {material}: deficit {deficit}, ordering (fast)")
+        # Buffer must be available ASAP, so order from the lowest-lead supplier
+        # (so day-0 orders can start on day 0 instead of waiting for a slow
+        # bulk delivery). Client-demand purchases still use the cost-benefit
+        # supplier choice.
+        _place_tranched(material, deficit, current_day, horizon_end,
+                        ddate=horizon_end, penalty=0.0, prod_days=1,
+                        w1_proj=w1_proj, prefer_fast=True)
 
 
 # ---------------------------------------------------------------------------
 # Main planner
 # ---------------------------------------------------------------------------
+
+def _urgency(line, current_day: int) -> float:
+    """Scheduling priority = penalty / slack, where slack is the days left
+    AFTER accounting for production time (Item 5). A tight, high-penalty order
+    gets a large urgency and front-loads ahead of looser ones. Robust to a
+    missing ddate/penalty (joined rows with no order line sort last)."""
+    ddate = line.get("ddate")
+    if ddate is None:
+        return 0.0
+    prod_days = expected_production_days(line["piece_type"])
+    slack = max(0.0, (int(ddate) - current_day) - prod_days)
+    return float(line.get("penalty") or 0.0) / max(0.1, slack)
+
 
 def replan(current_day: int):
     # Predictive buffer first, so it runs even with no client orders.
@@ -225,28 +277,37 @@ def replan(current_day: int):
     if not pending:
         return
 
-    pending.sort(key=lambda x: x["ddate"])
-    w2_occ, unload_occ = _empty_calendars(current_day)
+    # Item 5: order by DESCENDING urgency (not just ddate) so a tight,
+    # high-penalty order front-loads ahead of cheaper/looser ones.
+    pending.sort(key=lambda x: _urgency(x, current_day), reverse=True)
+    unload_occ = _empty_unload_calendar(current_day)
     horizon_end = current_day + PLANNING_HORIZON_DAYS
 
     already_scheduled = _existing_production_by_line()
-    already_purchased = _existing_purchases_unplaced()
     raw_stock = _current_raw_inventory()
-    w1_proj = _w1_occupancy_from_purchases(current_day)
 
     # Track raw material we mentally "consume" against current stock
     # while planning, so two pieces planned in the same call don't both
     # claim the same wood log.
     stock_remaining = dict(raw_stock)
 
+    # Item 5/6: finished goods already in W2 fulfil orders before any new
+    # production. Available = live inventory minus units already reserved for
+    # other order lines (stock_reservations), so two clients can't double-claim
+    # the same physical stock.
+    finished = _current_finished_inventory()
+    finished_remaining = {p: max(0, q - get_reserved(p))
+                          for p, q in finished.items()}
+
     demand: dict[tuple, int] = defaultdict(int)
     # Per-(prod_day, material) deadline/penalty/production-time context so
     # the second pass can run the cost-benefit supplier decision.
     demand_meta: dict[tuple, dict] = {}
-    prod_entries: list[tuple] = []
+    prod_entries: list[tuple] = []   # (day, piece, line_id, from_stock)
 
     # -----------------------------------------------------------------
-    # First pass: schedule each piece ASAP and accumulate gross demand.
+    # First pass: fulfil from finished stock, then schedule the rest ASAP
+    # and accumulate gross raw demand.
     # -----------------------------------------------------------------
     for line in pending:
         line_id = line["id"]
@@ -263,6 +324,27 @@ def replan(current_day: int):
             continue
         bom = BOM[piece]
 
+        # Stock-first: deliver from finished goods on hand, no production.
+        # Reserve them so a concurrent client cannot claim the same units.
+        from_stock_qty = min(finished_remaining.get(piece, 0), remaining)
+        scheduled_from_stock = 0
+        for _ in range(from_stock_qty):
+            delivery_day = _pick_delivery_day(ddate, unload_occ, horizon_end)
+            if delivery_day > horizon_end:
+                break
+            unload_occ[delivery_day] += 1
+            prod_entries.append((delivery_day, piece, line_id, True))
+            scheduled_from_stock += 1
+        if scheduled_from_stock > 0:
+            reserve_stock(line_id, piece, scheduled_from_stock)
+            finished_remaining[piece] -= scheduled_from_stock
+            remaining -= scheduled_from_stock
+            print(f"[plan] line {line_id}: {scheduled_from_stock} {piece} "
+                  f"fulfilled+reserved from finished stock (no production)")
+
+        # Production is targeted at current_day (ASAP); material lead times are
+        # absorbed by purchase arrivals. W2 occupancy is NOT tracked here.
+        prod_day = current_day
         for _ in range(remaining):
             delivery_day = _pick_delivery_day(ddate, unload_occ,
                                               horizon_end)
@@ -271,16 +353,7 @@ def replan(current_day: int):
                       f"schedule; piece will be late.")
                 continue
 
-            prod_day = _pick_production_day(delivery_day, w2_occ,
-                                            current_day)
-            if prod_day is None:
-                print(f"[plan] WARN: line {line_id} cannot be produced "
-                      f"in horizon; retry next day.")
-                continue
-
             unload_occ[delivery_day] += 1
-            for d in range(prod_day, delivery_day + 1):
-                w2_occ[d] += 1
 
             # Charge against existing W1 stock first.
             for material, qty_needed in bom.items():
@@ -302,9 +375,9 @@ def replan(current_day: int):
                     meta["penalty"] = max(meta["penalty"], penalty)
                     meta["prod_days"] = max(
                         meta["prod_days"],
-                        estimate_production_days(piece))
+                        expected_production_days(piece))
 
-            prod_entries.append((prod_day, piece, line_id))
+            prod_entries.append((prod_day, piece, line_id, False))
 
             if delivery_day > ddate:
                 days_late = delivery_day - ddate
@@ -314,67 +387,54 @@ def replan(current_day: int):
                 save_penalty_cost(line_id, delivery_day, penalty_cost)
 
     # -----------------------------------------------------------------
-    # Second pass: place purchase orders only for *net* unmet demand,
-    # subtracting both stock-on-hand and purchases already in flight.
+    # Second pass: aggregate raw demand per material, subtract material
+    # already inbound (incl. the baseline buffer, v3 Bug 5), and order the
+    # shortfall in W1-sized tranches (v3 Bug 2). Production days are absorbed
+    # by tranche arrival timing + the dispatch-time material gate (Bug 3/8A).
     # -----------------------------------------------------------------
-    for (prod_day, material), gross_qty in sorted(demand.items()):
-        key = (prod_day, material)
-        already_for_key = already_purchased.get(key, 0)
-        net_qty = max(0, gross_qty - already_for_key)
+    mat_demand: dict[str, int] = defaultdict(int)
+    mat_meta: dict[str, dict] = {}
+    for (prod_day, material), qty in demand.items():
+        mat_demand[material] += qty
+        dm = demand_meta.get((prod_day, material), {})
+        m = mat_meta.setdefault(material, {"ddate": horizon_end,
+                                           "penalty": 0.0, "prod_days": 1})
+        m["ddate"] = min(m["ddate"], dm.get("ddate", horizon_end))
+        m["penalty"] = max(m["penalty"], dm.get("penalty", 0.0))
+        m["prod_days"] = max(m["prod_days"], dm.get("prod_days", 1))
 
+    w1_proj = _project_w1_stock(current_day, raw_stock)
+    for material, gross_qty in sorted(mat_demand.items()):
+        meta = mat_meta[material]
+        # Bug 5: material already on order that arrives by the deadline covers
+        # part (or all) of the demand -> only order the shortfall.
+        inbound = _pending_inbound(material, by_day=meta["ddate"])
+        net_qty = max(0, gross_qty - inbound)
         if net_qty <= 0:
-            print(f"[plan] skip purchase: {material} day {prod_day} "
-                  f"demand={gross_qty} "
-                  f"already_in_flight={already_for_key}")
+            print(f"[plan] skip purchase: {material} demand={gross_qty} "
+                  f"covered by {inbound} already inbound (by day {meta['ddate']})")
             continue
-
-        # Respect W1 capacity at arrival day.
-        if w1_proj[prod_day] + net_qty > WAREHOUSE_CAPACITY:
-            print(f"[plan] WARN: W1 cap exceeded on day {prod_day} "
-                  f"for {material}; deferring purchase.")
-            # Try next available day with room.
-            shifted = prod_day
-            while (shifted <= horizon_end
-                   and w1_proj[shifted] + net_qty > WAREHOUSE_CAPACITY):
-                shifted += 1
-            if shifted > horizon_end:
-                print(f"[plan] ERROR: no W1 capacity in horizon for "
-                      f"{material} ({net_qty} units).")
-                continue
-            prod_day = shifted
-
-        meta = demand_meta.get((prod_day, material))
-        if meta:
-            (supplier, info, batch, cost,
-             exp_penalty, days_late) = _choose_supplier_cost_benefit(
-                material, net_qty, current_day, prod_day,
-                meta["ddate"], meta["penalty"], meta["prod_days"])
-        else:
-            days_slack = prod_day - current_day
-            supplier, info, batch, cost = _choose_supplier(
-                material, net_qty, days_slack)
-            exp_penalty, days_late = 0.0, 0
-
-        arrival_day = max(prod_day, current_day + info["lead"])
-        order_day = max(current_day, arrival_day - info["lead"])
-        add_purchase_entry(order_day, arrival_day, supplier,
-                           material, batch, cost)
-
-        already_purchased[key] = already_for_key + batch
-        w1_proj[arrival_day] += batch
-        print(f"[plan] purchase: {batch} {material} from {supplier} "
-              f"(order day {order_day}, arrives day {arrival_day}, "
-              f"cost {cost:.2f}€, net_demand={net_qty}; "
-              f"cost-benefit: exp_penalty={exp_penalty:.2f}€, "
-              f"days_late={days_late})")
+        _place_tranched(material, net_qty, current_day, horizon_end,
+                        meta["ddate"], meta["penalty"], meta["prod_days"],
+                        w1_proj)
 
     # -----------------------------------------------------------------
-    # Commit production entries.
+    # Commit production entries (from_stock rows deliver without producing).
+    # Each insert is its own transaction; guard per-entry so a single bad
+    # row (e.g. a line removed concurrently) cannot abort the whole replan.
     # -----------------------------------------------------------------
-    for prod_day, piece, line_id in prod_entries:
-        add_production_entry(prod_day, piece, 1, line_id)
+    committed = 0
+    for prod_day, piece, line_id, from_stock in prod_entries:
+        try:
+            add_production_entry(prod_day, piece, 1, line_id,
+                                 from_stock=from_stock)
+            committed += 1
+        except Exception as e:
+            print(f"[plan] skip scheduling line {line_id} ({piece}): {e}")
 
-    print(f"[plan] replan done: {len(prod_entries)} pieces scheduled, "
+    n_stock = sum(1 for e in prod_entries if e[3])
+    print(f"[plan] replan done: {committed}/{len(prod_entries)} pieces scheduled "
+          f"({n_stock} from finished stock), "
           f"{len(demand)} material demands evaluated, "
           f"stock_at_start=wood:{raw_stock['Wood']} "
           f"metal:{raw_stock['Metal']}")
@@ -385,48 +445,90 @@ def replan(current_day: int):
 # ---------------------------------------------------------------------------
 
 def dispatch_today(current_day: int, mqtt_bridge):
-    rows = production_due_on(current_day)
-    if rows:
-        total = sum(r["quantity"] for r in rows)
-        if total > MAX_UNLOAD_PER_DAY:
-            print(f"[dispatch] WARN: production on day {current_day} "
-                  f"totals {total} pieces; truncating.")
-            kept, accum = [], 0
-            for r in rows:
-                if accum + r["quantity"] <= MAX_UNLOAD_PER_DAY:
-                    kept.append(r)
-                    accum += r["quantity"]
-                else:
-                    remaining = MAX_UNLOAD_PER_DAY - accum
-                    if remaining > 0:
-                        rc = dict(r)
-                        rc["quantity"] = remaining
-                        kept.append(rc)
-                    break
-            rows = kept
-
-        items = [
-            {"production_plan_id": r["id"],
-             "order_line_id": r["order_line_id"],
-             "piece_type": r["piece_type"],
-             "quantity": r["quantity"]}
-            for r in rows
-        ]
-        mqtt_bridge.send_production_order(current_day, items)
-        mqtt_bridge.send_delivery_order(current_day, items)
-        mark_production_dispatched([r["id"] for r in rows])
-        print(f"[dispatch] day {current_day}: dispatched "
-              f"{sum(r['quantity'] for r in rows)} pieces to MES")
-
+    # --- 1. Raw-material arrivals FIRST, so today's production can use them.
     arrivals = purchases_arriving_on(current_day)
     for p in arrivals:
-        # Raw material physically lands in W1 today: reflect it in the
-        # inventory table so the ERP DB stops reading 0.
+        # Inventory is only credited when material PHYSICALLY arrives (v3
+        # Bug 4), not when the purchase was planned.
         update_inventory(p["material"], int(p["quantity"]))
         print(f"[dispatch] day {current_day}: sending material_load "
-              f"{p['quantity']} {p['material']} to MES "
-              f"(W1 inventory updated)")
+              f"{p['quantity']} {p['material']} to MES (W1 inventory updated)")
         mqtt_bridge.send_material_load_command(p["material"],
                                                p["quantity"])
     if arrivals:
         mark_purchase_placed([p["id"] for p in arrivals])
+
+    # --- 2. Dispatch production, most-urgent-first, but ONLY pieces whose BOM
+    #        is covered by raw on the floor (v3 Bug 8A). This stops the MES
+    #        queue bloating with pieces it cannot start. Raw is consumed at
+    #        dispatch (mirrors the MES W1 drain); finished stock is drawn at
+    #        delivery. Production scheduled earlier but still uncovered stays
+    #        eligible (production_due_on uses sim_day <= day, Bug 3).
+    rows = production_due_on(current_day)
+    if not rows:
+        return
+    rows = sorted(rows, key=lambda r: _urgency(r, current_day), reverse=True)
+
+    avail = _current_raw_inventory()          # {Wood, Metal}
+    chosen = []
+    for r in rows:
+        if len(chosen) >= MAX_UNLOAD_PER_DAY:
+            break
+        if r.get("from_stock"):               # finished goods: no raw needed
+            chosen.append(r)
+            continue
+        bom = BOM.get(r["piece_type"], {})
+        if all(avail.get(m, 0) >= q for m, q in bom.items() if q > 0):
+            for m, q in bom.items():
+                if q > 0:
+                    avail[m] = avail.get(m, 0) - q
+            chosen.append(r)
+        # else: not enough raw -> leave undispatched, retry a later day.
+
+    if not chosen:
+        waiting = len(rows)
+        print(f"[dispatch] day {current_day}: nothing dispatchable yet "
+              f"({waiting} pending, waiting on material)")
+        return
+
+    def _item(r):
+        return {"production_plan_id": r["id"],
+                "order_line_id": r["order_line_id"],
+                "piece_type": r["piece_type"],
+                "quantity": r["quantity"]}
+
+    def _deliver_item(r):
+        # Delivery items carry the FULL line context so the MES unloader can
+        # group a whole client order onto its dock(s): the line's TOTAL
+        # quantity (not just this slice), its due-date, and the client.
+        d = _item(r)
+        d["line_quantity"] = r.get("line_quantity")
+        d["ddate"]         = r.get("ddate")
+        d["client_order_id"] = r.get("client_order_id")
+        d["client_name"]   = r.get("client_name")
+        return d
+
+    prod_items = [_item(r) for r in chosen if not r.get("from_stock")]
+    deliver_items = [_deliver_item(r) for r in chosen]
+
+    if prod_items:
+        mqtt_bridge.send_production_order(current_day, prod_items)
+    mqtt_bridge.send_delivery_order(current_day, deliver_items)
+
+    for r in chosen:
+        if not r.get("from_stock"):
+            # Raw consumed by the production we just dispatched.
+            for m, q in BOM.get(r["piece_type"], {}).items():
+                if q > 0:
+                    update_inventory(m, -q)
+        # Finished good leaves W2 on delivery; produced pieces net to 0 once
+        # their COMPLETED (+1) arrives, from_stock draws a real surplus.
+        update_inventory(r["piece_type"], -int(r["quantity"]))
+        if r.get("from_stock") and r.get("order_line_id") is not None:
+            release_reservation(r["order_line_id"])
+
+    mark_production_dispatched([r["id"] for r in chosen])
+    n_stock = sum(1 for r in chosen if r.get("from_stock"))
+    print(f"[dispatch] day {current_day}: dispatched {len(chosen)} pieces "
+          f"to MES ({n_stock} from stock), {len(rows) - len(chosen)} held "
+          f"for material")

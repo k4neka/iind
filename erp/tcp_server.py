@@ -68,9 +68,9 @@ class OrderServer:
                 save_client_order(name, nif, oid, cur_day, lines)
                 accepted += 1
 
-            if accepted:
-                self.on_new_order(self.clock.current_day())
-
+            # Respond IMMEDIATELY (v3 Bug 1): the order is already persisted.
+            # Re-planning is slow (many DB round-trips + MQTT) and must NOT
+            # block the TCP response, or the client times out and retries.
             conn.sendall(json.dumps({
                 "status": "ok",
                 "accepted": accepted,
@@ -78,6 +78,11 @@ class OrderServer:
             }).encode())
             print(f"[tcp] {addr} -> accepted={accepted} "
                   f"rejected={len(rejected)}")
+
+            # on_new_order only signals a background worker (instant); the
+            # actual replan/dispatch happens off the TCP thread.
+            if accepted:
+                self.on_new_order(self.clock.current_day())
         except Exception as e:
             print(f"[tcp] error with {addr}: {e}")
         finally:

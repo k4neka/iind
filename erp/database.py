@@ -48,7 +48,10 @@ def init_db():
             piece_type      TEXT      NOT NULL,
             quantity        INTEGER   NOT NULL,
             order_line_id   INTEGER REFERENCES order_lines(id) ON DELETE CASCADE,
-            dispatched      BOOLEAN   DEFAULT FALSE
+            dispatched      BOOLEAN   DEFAULT FALSE,
+            -- TRUE = fulfilled from finished-goods stock: deliver only, do
+            -- NOT send a production order to the MES (stock-first, Item 5/6).
+            from_stock      BOOLEAN   DEFAULT FALSE
         );
 
         CREATE TABLE IF NOT EXISTS purchase_plan (
@@ -87,6 +90,18 @@ def init_db():
             key   TEXT PRIMARY KEY,
             value TEXT
         );
+
+        CREATE TABLE IF NOT EXISTS stock_reservations (
+            id              SERIAL PRIMARY KEY,
+            order_line_id   INTEGER NOT NULL REFERENCES order_lines(id) ON DELETE CASCADE,
+            piece_type      TEXT    NOT NULL,
+            quantity        INTEGER NOT NULL,
+            reserved_at     TIMESTAMPTZ DEFAULT NOW()
+        );
+
+        -- Backward-compatible migration for DBs created before from_stock.
+        ALTER TABLE production_plan
+            ADD COLUMN IF NOT EXISTS from_stock BOOLEAN DEFAULT FALSE;
         """)
 
         for p in ("Wood", "Metal", "RWW", "SWW", "RWM", "SWM", "RMM", "SMM"):
@@ -203,30 +218,6 @@ def get_pending_order_lines():
         return cur.fetchall()
 
 
-def get_all_orders():
-    with get_conn() as conn:
-        cur = _dict_cursor(conn)
-        cur.execute("""
-            SELECT co.id            AS client_order_pk,
-                   co.client_name,
-                   co.nif,
-                   co.order_id,
-                   co.received_day,
-                   co.status,
-                   ol.id            AS line_id,
-                   ol.piece_type,
-                   ol.quantity,
-                   ol.ddate,
-                   ol.penalty,
-                   ol.produced,
-                   ol.delivered
-              FROM client_orders co
-              JOIN order_lines  ol ON ol.client_order_id = co.id
-             ORDER BY ol.ddate ASC
-        """)
-        return cur.fetchall()
-
-
 def get_production_plan():
     with get_conn() as conn:
         cur = _dict_cursor(conn)
@@ -241,21 +232,15 @@ def get_purchase_plan():
         return cur.fetchall()
 
 
-def clear_undispatched_plans():
-    with get_conn() as conn:
-        cur = conn.cursor()
-        cur.execute("DELETE FROM production_plan WHERE dispatched = FALSE")
-        cur.execute("DELETE FROM purchase_plan   WHERE placed     = FALSE")
-        conn.commit()
-
-
-def add_production_entry(sim_day, piece_type, qty, order_line_id):
+def add_production_entry(sim_day, piece_type, qty, order_line_id,
+                         from_stock=False):
     with get_conn() as conn:
         cur = conn.cursor()
         cur.execute(
-            """INSERT INTO production_plan(sim_day, piece_type, quantity, order_line_id)
-               VALUES(%s,%s,%s,%s)""",
-            (sim_day, piece_type, qty, order_line_id),
+            """INSERT INTO production_plan(sim_day, piece_type, quantity,
+                                           order_line_id, from_stock)
+               VALUES(%s,%s,%s,%s,%s)""",
+            (sim_day, piece_type, qty, order_line_id, from_stock),
         )
         conn.commit()
 
@@ -291,23 +276,68 @@ def mark_purchase_placed(ids):
 
 
 def production_due_on(day):
+    # Join the order line + client so dispatch_today can sort by urgency
+    # (ddate/penalty) AND enrich each delivery item with the FULL line context
+    # the MES unloader needs (client, line total quantity, ddate) to group a
+    # whole client order onto its dock(s) and discharge it as one unit.
     with get_conn() as conn:
         cur = _dict_cursor(conn)
         cur.execute(
-            "SELECT * FROM production_plan WHERE sim_day=%s AND dispatched=FALSE",
+            # sim_day <= day: a piece scheduled earlier but not yet dispatched
+            # (its material had not arrived) stays eligible until it is sent,
+            # instead of being skipped once the day passes (v3 Bug 3).
+            """SELECT pp.*,
+                      ol.ddate     AS ddate,
+                      ol.penalty   AS penalty,
+                      ol.quantity  AS line_quantity,
+                      co.order_id  AS client_order_id,
+                      co.client_name AS client_name
+               FROM production_plan pp
+               LEFT JOIN order_lines   ol ON ol.id = pp.order_line_id
+               LEFT JOIN client_orders co ON co.id = ol.client_order_id
+               WHERE pp.sim_day <= %s AND pp.dispatched=FALSE""",
             (day,),
         )
         return cur.fetchall()
 
 
-def purchases_due_on(day):
+# ---------- finished-goods stock reservations (Item 5/6) ----------
+
+def reserve_stock(order_line_id, piece_type, qty):
+    """Reserve `qty` finished units for an order line so concurrent clients
+    cannot double-claim the same physical stock."""
     with get_conn() as conn:
-        cur = _dict_cursor(conn)
+        cur = conn.cursor()
         cur.execute(
-            "SELECT * FROM purchase_plan WHERE order_day=%s AND placed=FALSE",
-            (day,),
+            """INSERT INTO stock_reservations(order_line_id, piece_type, quantity)
+               VALUES(%s,%s,%s)""",
+            (order_line_id, piece_type, int(qty)),
         )
-        return cur.fetchall()
+        conn.commit()
+
+
+def get_reserved(piece_type):
+    """Total finished units of `piece_type` reserved but not yet released."""
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT COALESCE(SUM(quantity),0) FROM stock_reservations "
+            "WHERE piece_type=%s",
+            (piece_type,),
+        )
+        return int(cur.fetchone()[0])
+
+
+def release_reservation(order_line_id):
+    """Drop all reservations for an order line (its stock was delivered or
+    the order was cancelled)."""
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "DELETE FROM stock_reservations WHERE order_line_id=%s",
+            (order_line_id,),
+        )
+        conn.commit()
 
 
 def log_mes_status(ts, topic, payload):
@@ -369,17 +399,6 @@ def save_penalty_cost(order_line_id, sim_day, penalty_cost):
         )
         conn.commit()
 
-
-def save_raw_cost(order_line_id, sim_day, raw_cost):
-    """Persist raw-material cost associated with an order line."""
-    with get_conn() as conn:
-        cur = conn.cursor()
-        cur.execute(
-            """INSERT INTO production_costs(order_line_id, sim_day, raw_cost)
-               VALUES(%s,%s,%s)""",
-            (order_line_id, sim_day, raw_cost),
-        )
-        conn.commit()
 
 def purchases_arriving_on(day):
     # Purchases whose material physically arrives at W1 on `day`,

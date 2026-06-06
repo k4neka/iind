@@ -1,25 +1,34 @@
-"""Production planner with tool-change minimisation and batching.
+"""Production planner with tool-change minimisation.
 
-For every CHUNK of up-to-PRODUCT_BATCH_SIZE queued final products of
-the same type, the planner emits a sequence of subparts intended for a
-single cell:
+Exactly ONE final product per chunk (physical invariant: the SFS M3
+assembly consumes every parked leg when a top arrives, so only 2 legs may
+be parked before 1 top). Each chunk emits, for a single cell:
 
-  - 2 * batch_size leg subparts, alternating between M1 and M2 to use
-    the two shaping machines in parallel.
-  - batch_size top subparts, each followed by an M3 assembly op.
+  - 2 leg subparts, alternating M1/M2 to shape on both machines in parallel
+    (each parked at M3),
+  - 1 top subpart followed by the M3 assembly op.
 
 The optimiser only proposes a `target_cell`; the dispatcher is free to
 override it if the suggested cell isn't immediately available.
 """
-from config import PRODUCT_BATCH_SIZE
 from transformations import (CELL_TOOLS, TOOL_CHANGE_TIME, PIECE_ID,
                              find_single, find_assembly, raw_for)
 
 
 class CellTimeline:
-    def __init__(self):
+    def __init__(self, tool_state=None):
         self.ready = {c: {1: 0.0, 2: 0.0, 3: 0.0} for c in CELL_TOOLS}
+        # Seed the mounted-tool model from the live per-cell tool state
+        # (ToolStateTracker.all_cells_snapshot) so the tool-change estimate carries
+        # over between consecutive optimise_batch() calls instead of starting
+        # from None (i.e. assuming a fresh, tool-less cell) every batch.
         self.tool = {c: {1: None, 2: None, 3: None} for c in CELL_TOOLS}
+        if tool_state:
+            for c, slots in tool_state.items():
+                if c in self.tool:
+                    for slot, tool in slots.items():
+                        if slot in self.tool[c]:
+                            self.tool[c][slot] = tool
 
     def cost_to_run(self, cell, slot, tool, duration,
                     earliest_start=0.0):
@@ -142,11 +151,12 @@ def _plan_chunk(piece_type: str, count: int, tl: CellTimeline,
         subparts.append({
             "raw": PIECE_ID[raw_for(asm["leg"])],
             "ops": ops,
+            "final": False,          # a parked leg; never fires g_Done
         })
         cell_entry_free_at = max(cell_entry_free_at, tl.ready[cell][1])
 
     # Phase 2: `count` top + assembly subparts.
-    for _ in range(count):
+    for top_idx in range(count):
         picked = _best_slot_sticky(asm["top"], cell, tl,
                                    cell_entry_free_at,
                                    prefer_slot=1)
@@ -169,13 +179,15 @@ def _plan_chunk(piece_type: str, count: int, tl: CellTimeline,
         subparts.append({
             "raw": PIECE_ID[raw_for(asm["top"])],
             "ops": ops,
+            "final": True,           # the assembled final product
+            "final_index": top_idx,  # -> chunk_rows[top_idx]
         })
         cell_entry_free_at = max(cell_entry_free_at, tl.ready[cell][1])
 
     return cell, subparts
 
 
-def optimise_batch(queued_pieces, rr_offset_by_family=None):
+def optimise_batch(queued_pieces, rr_offset_by_family=None, tool_state=None):
     """Plan the queue.
 
     Returns a list of tuples:
@@ -184,8 +196,12 @@ def optimise_batch(queued_pieces, rr_offset_by_family=None):
     `rr_offset_by_family` is an optional dict {capable_cells_tuple: int}
     that the dispatcher may pass in to seed the round-robin across
     repeated calls. If None, an internal counter is used.
+
+    `tool_state` is an optional {cell: {slot: tool}} snapshot
+    (ToolStateTracker.all_cells_snapshot) used to seed the tool-change model so
+    estimates carry the currently-mounted tools forward.
     """
-    tl = CellTimeline()
+    tl = CellTimeline(tool_state=tool_state)
 
     groups: dict[str, list] = {}
     order: list[str] = []
@@ -209,30 +225,24 @@ def optimise_batch(queued_pieces, rr_offset_by_family=None):
 
     family_rr: dict[tuple, int] = dict(rr_offset_by_family or {})
     out = []
-    batch = max(1, int(PRODUCT_BATCH_SIZE))
 
+    # One product per chunk (no batching). Round-robin spreads consecutive
+    # same-type products across capable cells.
     for pt in order:
-        rows = groups[pt]
-        i = 0
-        while i < len(rows):
-            chunk_rows = rows[i:i + batch]
-            i += batch
-            n = len(chunk_rows)
-
-            caps = tuple(capable_cells(pt))
-            if not caps:
-                continue
-
+        caps = tuple(capable_cells(pt))
+        if not caps:
+            continue
+        for row in groups[pt]:
             idx = family_rr.get(caps, 0)
             hint = (list(caps[idx % len(caps):])
                     + list(caps[:idx % len(caps)]))
             family_rr[caps] = idx + 1
 
-            result = _plan_chunk(pt, n, tl, preferred_cells=hint)
+            result = _plan_chunk(pt, 1, tl, preferred_cells=hint)
             if result is None:
                 continue
             cell, subparts = result
-            out.append((chunk_rows, cell, list(caps), subparts))
+            out.append(([row], cell, list(caps), subparts))
 
     # Return planning + new RR state so the caller can persist it.
     return out, family_rr
