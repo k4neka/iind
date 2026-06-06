@@ -10,7 +10,7 @@ from config import (MQTT_BROKER, MQTT_PORT,
                     MQTT_TOPIC_MATERIAL_LOAD_WOOD,
                     MQTT_TOPIC_MATERIAL_LOAD_METAL,
                     MQTT_TOPIC_MATERIAL_LOAD,
-                    BOM)
+                    MQTT_TOPIC_END_OF_DAY)
 from database import log_mes_status, update_inventory
 
 try:
@@ -35,6 +35,11 @@ class MQTTBridge:
         if mqtt is None:
             print("[mqtt] paho-mqtt not installed; running in stub mode")
             return
+        # piece_db_id of every COMPLETED already counted this run. Belt-and-
+        # suspenders against a duplicate completion from the CODESYS corridor
+        # defect (§7.1): even if a stray re-report slips past the MES dedupe,
+        # the ERP must not double-count inventory / drive raw stock negative.
+        self._counted_pieces = set()
         self.client = mqtt.Client(client_id="ERP")
         self.client.on_connect = self._on_connect
         self.client.on_message = self._on_message
@@ -65,10 +70,11 @@ class MQTTBridge:
     def _sync_inventory(self, raw_payload):
         """Keep the ERP inventory table in lock-step with the plant.
 
-        Every COMPLETED piece the MES reports consumes its raw materials
-        (per BOM) and adds one finished product to stock. Together with
-        the raw-arrival update in dispatch_today, this is what makes the
-        inventory table reflect real stock instead of staying at 0.
+        Each COMPLETED piece adds +1 finished product to stock. Raw material
+        is NOT decremented here: it is consumed at dispatch time in
+        dispatch_today (v3 Bug 4), mirroring the MES W1 drain, so the ERP raw
+        inventory matches the physical floor. Deduped by piece_db_id so a
+        re-reported completion can't double-count (§7.1).
         """
         try:
             data = json.loads(raw_payload)
@@ -79,12 +85,15 @@ class MQTTBridge:
         piece = data.get("piece_type")
         if not piece:
             return
+        pdid = data.get("piece_db_id")
+        if pdid is not None:
+            if pdid in self._counted_pieces:
+                print(f"[erp] inventory sync: piece_db_id={pdid} already "
+                      f"counted this run; ignoring duplicate COMPLETED")
+                return
+            self._counted_pieces.add(pdid)
         update_inventory(piece, 1)
-        for material, qty in BOM.get(piece, {}).items():
-            if qty > 0:
-                update_inventory(material, -qty)
-        print(f"[erp] inventory sync: +1 {piece}, consumed "
-              f"{ {m: q for m, q in BOM.get(piece, {}).items() if q > 0} }")
+        print(f"[erp] inventory sync: +1 {piece} (finished)")
 
     def start(self):
         if self.client is None:
@@ -128,3 +137,11 @@ class MQTTBridge:
             "quantity":   quantity,
             "message_id": str(uuid.uuid4()),
         }, retain=True)
+    
+    def send_end_of_day(self, sim_day):
+        """Tell the MES the sim day has ended so it discharges every loaded
+        unloading dock (PDF §2.4 / §4.1: pieces are placed during the day and
+        unloaded automatically at the end of the day). The ERP owns the sim
+        clock, so it is the authority on when a day ends."""
+        self._publish(MQTT_TOPIC_END_OF_DAY, {"sim_day": sim_day})
+        

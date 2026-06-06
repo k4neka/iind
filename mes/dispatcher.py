@@ -20,11 +20,13 @@ the same `_busy_cells` lease registry so they never claim the same
 physical cell at once.
 """
 import asyncio
+from datetime import datetime, timezone
 
 from config import NUM_CELLS, COMPLEX_PIECES, COMPLEX_RECIPE
-from database import (queued_pieces, mark_dispatched, mark_completed)
+from database import queued_pieces, mark_dispatched, mark_cell_started
 from optimizer import optimise_batch
 from transformations import ID_TO_PIECE
+from piece_id import next_piece_id
 
 # Machine slot used as the in-cell assembly buffer / assembly station for
 # complex pieces.
@@ -32,9 +34,11 @@ M3 = 3
 
 
 class Dispatcher:
-    def __init__(self, plc, mqtt_bridge, busy_cells=None, busy_lock=None):
+    def __init__(self, plc, mqtt_bridge, busy_cells=None, busy_lock=None,
+                 tool_tracker=None):
         self.plc = plc
         self.mqtt = mqtt_bridge
+        self.tools = tool_tracker
         self._tick_count = 0
         self._last_log_tick = -100
         # Shared with the ComplexOrchestrator when injected, so the two
@@ -83,9 +87,9 @@ class Dispatcher:
                 self.mqtt.w1_consume(raw_name, 1)
 
     async def _choose_free_cell(self, capable, target_hint):
-        """Return the first cell in `capable` that is both PLC-free
-        and not held by another in-flight chunk. `target_hint` is
-        tried first to honour the optimiser's preference."""
+        """Return the first cell in `capable` that is both PLC-free and not
+        held by another in-flight chunk. `target_hint` is tried first to
+        honour the optimiser's preference."""
         ordered = []
         if target_hint in capable:
             ordered.append(target_hint)
@@ -128,7 +132,9 @@ class Dispatcher:
             return
 
         chunks, new_rr = optimise_batch(
-            pending, rr_offset_by_family=self._family_rr
+            pending, rr_offset_by_family=self._family_rr,
+            tool_state=(self.tools.all_cells_snapshot() if self.tools
+                        else None),
         )
         # Persist round-robin so the NEXT tick (and the next replan
         # triggered by a new client order) keeps rotating cells.
@@ -168,37 +174,64 @@ class Dispatcher:
                         op["cell"] = cell
 
             self._consume_w1(subparts)
-            for row in chunk_rows:
-                mark_dispatched(row["id"], cell, subparts[0]["raw"])
-            print(f"[disp] chunk of {len(chunk_rows)} "
-                  f"({chunk_rows[0]['piece_type']}) -> Cell_{cell} "
-                  f"as {len(subparts)} subparts "
+            # One product per chunk: one wire PieceID/ParentID from the shared
+            # generator (INT16-safe, never the unbounded DB serial id). The DB
+            # row stores it so completion_loop can map g_Done back to the row.
+            wire = next_piece_id()
+            row = chunk_rows[0]
+            mark_dispatched(row["id"], cell, subparts[0]["raw"],
+                            wire_piece_id=wire)
+            print(f"[disp] {row['piece_type']} (db id {row['id']}, "
+                  f"wire {wire}) -> Cell_{cell} as {len(subparts)} subparts "
                   f"(hint was Cell_{target_cell})")
 
             asyncio.create_task(
-                self._run_chunk(chunk_rows, cell, subparts)
+                self._run_chunk(chunk_rows, cell, subparts, wire)
             )
 
     # ---- subpart send loop ---------------------------------------------
 
-    async def _run_chunk(self, chunk_rows, cell, subparts):
+    async def _run_chunk(self, chunk_rows, cell, subparts, wire):
         try:
             for idx, sp in enumerate(subparts, start=1):
+                # PieceID/ParentID route completion through g_Done. The final
+                # (assembled) subpart carries the product's wire id as both
+                # PieceID and ParentID, so Store_Piece_Ack fires a g_Done entry
+                # at the cell Win (completion_loop maps wire -> row, marks
+                # COMPLETED). Parked legs carry their own wire PieceID and the
+                # product's wire id as ParentID; they never reach a Win so they
+                # never fire g_Done.
+                if sp.get("final"):
+                    piece_id = parent_id = wire
+                else:
+                    piece_id = next_piece_id()
+                    parent_id = wire
                 # Use the shared cell handshake in the PLC client (the
                 # single source of truth: wait head free -> write + recv
                 # -> wait accepted -> drop recv -> wait head ready),
                 # instead of re-implementing the protocol here.
                 try:
                     ok = await self.plc.send_workpiece_handshake(
-                        cell, sp["raw"], sp["ops"])
+                        cell, sp["raw"], sp["ops"],
+                        piece_id=piece_id, parent_id=parent_id)
                 except Exception as e:
                     print(f"[disp] subpart {idx} handshake error: {e}")
                     ok = False
                 if not ok:
                     print(f"[disp] chunk aborted at subpart {idx}")
                     return
-            print(f"[disp] chunk of {len(chunk_rows)} "
-                  f"({chunk_rows[0]['piece_type']}) all subparts sent "
+                # First subpart accepted -> the piece physically entered the
+                # cell. Stamp cell_started_at so timing excludes queue wait.
+                if idx == 1:
+                    try:
+                        mark_cell_started(chunk_rows[0]["id"],
+                                          datetime.now(timezone.utc))
+                    except Exception as e:
+                        print(f"[disp] mark_cell_started error: {e}")
+                # Carry the mounted-tool state forward for the next batch.
+                if self.tools:
+                    self.tools.apply_ops(cell, sp["ops"])
+            print(f"[disp] {chunk_rows[0]['piece_type']} all subparts sent "
                   f"to Cell_{cell}")
         finally:
             async with self._busy_lock:
@@ -216,49 +249,48 @@ class Dispatcher:
 #                they shape at the same time; each carries a trailing no-op at
 #                M3 so it parks in the assembly buffer and never leaves.
 #              * shape the wood top in a wood cell (1 or 2); it exits to W2.
-#   Phase B  Use the Transfer_Cell to bring ONLY the top from W2 to W1.
+#   Phase B  The PLC Router corridor brings ONLY the top from W2 to W1
+#            (driven entirely PLC-side; the MES does not touch Transfer_*).
 #   Phase C  Re-inject the top into the assembly cell at M3 with tool 9. The
 #            two parked legs are consumed; the finished product exits to W2.
-#   Phase D  Mark the order complete, report it, and return the finished
-#            product to W1 (via the shared TransferManager).
+#   Phase D  Mark the order complete and report it. The finished product
+#            STAYS in W2 (v3 Bug 6) — no W2->W1 return.
 #
 # Only the top crosses the corridor; the legs stay in the assembly cell.
-# Complex pieces are processed one at a time so the single Transfer_Cell and
-# the assembly-cell buffer never get crossed between two products.
 
 
 class ComplexOrchestrator:
-    def __init__(self, plc, mqtt_bridge, publish_status, transfer_manager,
-                 busy_cells: set, busy_lock: asyncio.Lock):
+    def __init__(self, plc, mqtt_bridge, publish_status,
+                 busy_cells: set, busy_lock: asyncio.Lock,
+                 tool_tracker=None):
         self.plc = plc
         self.mqtt = mqtt_bridge
         self.publish_status = publish_status
-        self.transfers = transfer_manager
+        self.tools = tool_tracker
         # Shared with the Dispatcher so simple and complex production
         # never claim the same physical cell at once.
         self._busy_cells = busy_cells
         self._busy_lock = busy_lock
         self._inflight = 0       # number of complex products in flight
-        # Unique PieceID source for sub-pieces (legs). Never 0 (0 = empty slot
-        # in the PLC completion buffer). The PLC Workpiece_T.PieceID is INT
-        # (16-bit signed: -32768..32767), so this MUST stay under 32767. We use
-        # a band well above DB pids (which start at 1) but safely in range.
-        self._piece_id_seq = 1000
-        # Per in-flight product: parent_id -> assembly cell held, released on
+        # Per in-flight product: wire id -> assembly cell held, released on
         # completion. A dict (not a single var) because several run in parallel.
         self._held_cell = {}
         # The PLC g_Router_Order is a SINGLE intake slot. With parallel
         # products, two _produce tasks would write it at once and clobber each
-        # other (the dropped-route WARN). This lock serialises the intake
-        # handshake: each route completes its take-ACK before the next starts.
-        # Production stays parallel on the floor; only the push is serialised.
+        # other. This lock serialises the intake handshake.
         self._router_lock = asyncio.Lock()
+        # Wood-cell top shaping spreads across M2 and M1 of the wood cell: the
+        # first top of a pair shapes on M2, the second on M1, so two tops shape
+        # in parallel (M1 is upstream of M2 in the cell, so a top at M1 and a
+        # top at M2 run concurrently) instead of serialising on M1. The machine
+        # is picked under _router_lock so it follows the actual push order.
+        self._top_machines = [2, 1]
+        self._top_rr = 0
 
-    def _next_piece_id(self) -> int:
-        self._piece_id_seq += 1
-        if self._piece_id_seq > 30000:   # wrap, staying inside INT16
-            self._piece_id_seq = 1001
-        return self._piece_id_seq
+    def _next_top_machine(self) -> int:
+        m = self._top_machines[self._top_rr % len(self._top_machines)]
+        self._top_rr += 1
+        return m
 
     # ---- helpers --------------------------------------------------------
 
@@ -308,11 +340,8 @@ class ComplexOrchestrator:
 
     async def _tick(self):
         # Parallel complex production: allow as many in flight as there are
-        # assembly cells (Cell_3, Cell_4). _inflight counts products that have
-        # claimed a cell and not yet completed. Tops are all shaped in the
-        # single wood cell (serialised naturally there); only the assembly
-        # cells run in parallel, so two RWM never fight over the corridor
-        # (the wood cell hands their tops to W2 one at a time).
+        # assembly cells (Cell_3, Cell_4). Tops are all shaped in the single
+        # wood cell; only the assembly cells run in parallel.
         asm_pool = COMPLEX_RECIPE.get("RWM", {}).get("asm", {}).get(
             "cells", [3, 4])
         if self._inflight >= len(asm_pool):
@@ -328,38 +357,38 @@ class ComplexOrchestrator:
             return  # wait for raw material to arrive in W1
 
         # Claim the order so neither the dispatcher nor the next tick
-        # picks it up again.
-        mark_dispatched(row["id"], cell=0, init_piece_id=rec["top"]["id"])
+        # picks it up again. Allocate one INT16-safe wire id for the product.
+        wire = next_piece_id()
+        mark_dispatched(row["id"], cell=0, init_piece_id=rec["top"]["id"],
+                        wire_piece_id=wire)
         self._inflight += 1
-        asyncio.create_task(self._produce(row, rec))
+        asyncio.create_task(self._produce(row, rec, wire))
 
     # ---- production pipeline -------------------------------------------
 
-    async def _produce(self, row, rec):
+    async def _produce(self, row, rec, wire):
         """Form A: build the routes for a complex piece and push them to the
         PLC-side Router, which carries each piece through cells + corridor on
-        its own. The MES no longer orchestrates cells/corridor step by step.
+        its own.
 
-        Three routes are emitted per complex product:
+        Three routes per complex product:
           * leg 1: Metal -> asm_cell M2 (shape), then park at M3 (no-op)
           * leg 2: Metal -> asm_cell M1 (shape), then park at M3 (no-op)
-          * top  : Wood -> top_cell M1 (shape), then TRANSFER (Cell 0,
+          * top  : Wood -> top_cell M2/M1 (shape), then TRANSFER (Cell 0,
                    PieceArg = shaped top id), then assemble at asm_cell M3.
 
-        Completion is reported asynchronously by the PLC completion buffer
-        (g_Done_*), consumed by the MES completion_loop — NOT marked here.
+        `wire` is the INT16-safe wire id (from the shared generator) used as
+        the product's PieceID/ParentID; completion is reported asynchronously
+        by the PLC completion buffer (g_Done_*) keyed on it, consumed by the
+        MES completion_loop — NOT marked here.
         """
         pt = row["piece_type"]
         pid = row["id"]
         top, leg, asm = rec["top"], rec["leg"], rec["asm"]
-        print(f"[complex] start {pt} (db id {pid}) -> routing to PLC Router")
+        print(f"[complex] start {pt} (db id {pid}, wire {wire}) "
+              f"-> routing to PLC Router")
 
-        # Choose a FREE assembly cell from the pool (e.g. [3, 4]) so two RWM
-        # do not collide on the same Cell_3. We claim it for the whole product
-        # (legs + assembly happen there) and release it on completion. The top
-        # is always shaped in a single wood cell (Cell_1); only the assembly
-        # cell alternates, exactly as described: 2 legs to Cell_3/Cell_4,
-        # tops via Cell_1, then to different assembly cells.
+        # Choose a FREE assembly cell from the pool so two RWM do not collide.
         asm_cell = await self._claim_cell(asm["cells"])
         if asm_cell is None:
             print(f"[complex] {pt}: no free assembly cell in {asm['cells']}; "
@@ -388,34 +417,40 @@ class ComplexOrchestrator:
                 async with self._router_lock:
                     await self.plc.router_send_route(
                         init_piece=leg["raw_id"], operations=leg_ops,
-                        piece_id=self._next_piece_id(), parent_id=pid)
+                        piece_id=next_piece_id(), parent_id=wire)
+                if self.tools:
+                    self.tools.apply_ops(asm_cell, leg_ops)
 
-            # --- Route for the top: shape, transfer W2->W1, assemble. The
-            #     transfer op carries the shaped-top id in piece_arg so the
-            #     corridor pulls the right piece out of W2. ---
-            top_ops = [
-                {"cell": top_cell, "machine": top["machine"],
-                 "tool": top["tool"], "op_time_s": top["time_s"],
-                 "piece_arg": 0},
-                {"cell": 0, "machine": 0, "tool": 0, "op_time_s": 0,
-                 "piece_arg": top["id"]},          # transfer: pull shaped top
-                {"cell": asm_cell, "machine": asm["machine"],
-                 "tool": asm["tool"], "op_time_s": asm["time_s"],
-                 "piece_arg": 0},
-            ]
-            print(f"[complex] {pt}: route top -> Cell_{top_cell} shape, "
-                  f"transfer, assemble@Cell_{asm_cell}")
+            # --- Route for the top: shape, transfer W2->W1, assemble. Machine
+            #     (M2/M1) and the push are decided together under the lock so
+            #     "first top -> M2, second -> M1" stays deterministic and the
+            #     two tops shape in parallel in the wood cell. ---
             async with self._router_lock:
+                top_machine = self._next_top_machine()
+                top_ops = [
+                    {"cell": top_cell, "machine": top_machine,
+                     "tool": top["tool"], "op_time_s": top["time_s"],
+                     "piece_arg": 0},
+                    {"cell": 0, "machine": 0, "tool": 0, "op_time_s": 0,
+                     "piece_arg": top["id"]},          # transfer: pull shaped top
+                    {"cell": asm_cell, "machine": asm["machine"],
+                     "tool": asm["tool"], "op_time_s": asm["time_s"],
+                     "piece_arg": 0},
+                ]
+                print(f"[complex] {pt}: route top -> Cell_{top_cell} "
+                      f"M{top_machine} shape, transfer, assemble@Cell_{asm_cell}")
                 await self.plc.router_send_route(
                     init_piece=top["raw_id"], operations=top_ops,
-                    piece_id=pid, parent_id=pid)   # final product keyed by pid
+                    piece_id=wire, parent_id=wire)  # final product keyed by wire
+                if self.tools:
+                    self.tools.apply_ops(top_cell, top_ops)
+                    self.tools.apply_ops(asm_cell, top_ops)
 
-            print(f"[complex] {pt} (db id {pid}) fully routed to PLC; "
-                  f"completion will arrive via g_Done buffer")
-            # Parallel: HOLD this product's assembly cell until the PLC reports
-            # it done (on_complete releases it). Several products may be held at
-            # once, each under its own parent id.
-            self._held_cell[pid] = asm_cell
+            print(f"[complex] {pt} (db id {pid}, wire {wire}) fully routed "
+                  f"to PLC; completion will arrive via g_Done buffer")
+            # HOLD this product's assembly cell until the PLC reports it done
+            # (on_complete releases it). Several may be held at once.
+            self._held_cell[wire] = asm_cell
             return                      # do NOT release here
         except Exception as e:
             print(f"[complex] {pt}: routing error: {e}")
@@ -423,13 +458,28 @@ class ComplexOrchestrator:
         self._release_cell(asm_cell)
         self._inflight = max(0, self._inflight - 1)
 
-    def on_complete(self, parent_id: int):
+    async def on_complete(self, parent_id: int):
         """Called by the MES completion_loop when the PLC reports a finished
-        product. Releases that product's held assembly cell and frees one
-        in-flight slot. Matches by parent id; ignores completions for products
-        we are not tracking (e.g. simple pieces, which never registered here)."""
-        if parent_id in self._held_cell:
-            self._release_cell(self._held_cell.pop(parent_id))
-            self._inflight = max(0, self._inflight - 1)
-            print(f"[complex] parent={parent_id} done; cell released, "
-                  f"inflight={self._inflight}")
+        product. Drives the stale re-injection recv_cmd on the held assembly
+        cell low, releases that cell and frees one in-flight slot. Ignores
+        completions for products we are not tracking.
+
+        MES band-aid for the CODESYS defect in §7.1: the corridor's
+        Dispatch_At_Wh1 re-injects the transferred top by RAISING
+        Cell_c_Top_Order.recv_cmd but never lowers it. With recv_cmd stuck
+        high the assembly cell's Wout can never finish ugly_hack -> free, so
+        the cell reads busy forever and its (now finished-product) workpiece
+        data keeps re-entering W2, re-firing g_Done -> duplicate completions.
+        Driving recv_cmd low here closes that handshake. (The proper fix lives
+        in CODESYS — see the change note.)"""
+        asm_cell = self._held_cell.pop(parent_id, None)
+        if asm_cell is None:
+            return
+        try:
+            await self.plc.clear_recv_cmd(asm_cell)
+        except Exception as e:
+            print(f"[complex] clear_recv_cmd(Cell_{asm_cell}) failed: {e}")
+        self._release_cell(asm_cell)
+        self._inflight = max(0, self._inflight - 1)
+        print(f"[complex] parent={parent_id} done; Cell_{asm_cell} recv_cmd "
+              f"cleared + released, inflight={self._inflight}")

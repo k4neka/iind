@@ -32,22 +32,59 @@ def main():
     mqtt.start()
     _wait_mqtt(mqtt)
 
-    # Compute the plan but do NOT dispatch on startup. The first
-    # dispatch happens via on_new_day (or on_new_order if a client
-    # places an order whose prod_day is today).
-    replan(clock.current_day())
+    # Single serialised plan step. replan and dispatch are INDEPENDENT: if
+    # replan fails (e.g. a transient DB/FK error), dispatch_today STILL runs so
+    # already-scheduled production is sent to the MES once its material arrives
+    # — the machines never stall just because one replan threw.
+    plan_lock = threading.Lock()
+
+    def do_plan(day: int):
+        with plan_lock:
+            try:
+                replan(day)
+            except Exception as e:
+                print(f"[plan] replan error (continuing to dispatch): {e}")
+            try:
+                dispatch_today(day, mqtt)
+            except Exception as e:
+                print(f"[dispatch] error: {e}")
+
+    # Compute the initial plan but do not dispatch on startup beyond what
+    # do_plan does (no material has arrived yet).
+    do_plan(clock.current_day())
 
     def on_new_day(day: int):
         print(f"\n=== [sim] New day: {day} ===")
-        replan(day)
-        dispatch_today(day, mqtt)
+        # The day that just ENDED is `day - 1`: tell the MES to discharge every
+        # unloading dock that was loaded during it (pieces placed during the
+        # day are unloaded automatically at end-of-day, PDF §2.4/§4.1). Done
+        # BEFORE today's plan so the docks are clear for today's deliveries.
+        if day > 0:
+            try:
+                mqtt.send_end_of_day(day - 1)
+            except Exception as e:
+                print(f"[erp] send_end_of_day({day - 1}) failed: {e}")
+        do_plan(day)
 
     clock.add_day_listener(on_new_day)
     clock.start()
 
-    def on_new_order(day: int):
-        replan(day)
-        dispatch_today(day, mqtt)
+    # Client orders are handled by ONE coalescing worker thread, not a thread
+    # per order: the TCP handler just signals (instant response, v3 Bug 1) and
+    # the worker runs a single replan+dispatch, draining a burst of orders in
+    # one pass. This removes the concurrent-replan race entirely.
+    order_event = threading.Event()
+
+    def order_worker():
+        while True:
+            order_event.wait()
+            order_event.clear()
+            do_plan(clock.current_day())
+
+    threading.Thread(target=order_worker, daemon=True).start()
+
+    def on_new_order(_day: int):
+        order_event.set()
 
     server = OrderServer(clock, on_new_order)
     server.start()

@@ -1,10 +1,9 @@
 """MQTT bridge: subscribes to ERP topics and publishes MES status.
 
-Maintains a *local* W1 estimate (wood/metal) because the PLC's
-g_W1_Count is not authoritative in the current CODESYS project. The
-estimate is incremented when raw material is successfully dispatched
-to the Loader and decremented when the dispatcher consumes a piece
-for production.
+Maintains a *local* W1 estimate (wood/metal) for fast dispatch decisions,
+but periodically snaps it to the PLC's authoritative W1Count[1..2] (see
+w1_sync_from_plc) so a queued-but-not-yet-started order can't make the MES
+believe it consumed material that never physically left W1.
 """
 import asyncio
 import json
@@ -16,8 +15,9 @@ import paho.mqtt.client as mqtt
 from config import (MQTT_BROKER, MQTT_PORT,
                     TOPIC_MATERIAL_LOAD, TOPIC_MATERIAL_LOAD_WOOD,
                     TOPIC_MATERIAL_LOAD_METAL,
-                    TOPIC_PRODUCTION_ORDERS, TOPIC_MES_STATUS)
-from database import (enqueue_piece, is_message_consumed,
+                    TOPIC_PRODUCTION_ORDERS, TOPIC_MES_STATUS, MAX_QUEUED,
+                    TOPIC_DELIVERY_ORDERS, TOPIC_END_OF_DAY)
+from database import (enqueue_piece, queued_pieces, is_message_consumed,
                       mark_message_consumed)
 
 
@@ -28,9 +28,10 @@ RETAINED_IGNORE_WINDOW_S = 5.0
 
 
 class MESMqtt:
-    def __init__(self, loop, plc):
+    def __init__(self, loop, plc, unloader=None):
         self.loop = loop
         self.plc = plc
+        self.unloader = unloader
         self.client = mqtt.Client(client_id="MES")
         self.client.on_connect = self._on_connect
         self.client.on_message = self._on_message
@@ -43,8 +44,8 @@ class MESMqtt:
 
         self._flushing = False
 
-        # Local W1 inventory model. Tracked here because the PLC does
-        # not maintain g_W1_Count reliably in the current project.
+        # Local W1 inventory model. Used for fast dispatch decisions; snapped
+        # to the PLC's W1Count by w1_sync_from_plc on the warehouse poll loop.
         self._w1_local = {"Wood": 0, "Metal": 0}
         self._w1_lock = threading.Lock()
 
@@ -70,27 +71,29 @@ class MESMqtt:
                   f"{self._w1_local['Wood']} "
                   f"metal:{self._w1_local['Metal']})")
 
-    def w1_reset(self, wood=0, metal=0):
-        """Reset the local W1 model. Call this on MES startup if the
-        physical line was reset, or when re-syncing with a trusted
-        external source of truth."""
-        with self._w1_lock:
-            self._w1_local["Wood"] = int(wood)
-            self._w1_local["Metal"] = int(metal)
-            print(f"[w1] RESET to wood={wood} metal={metal}")
+    def w1_sync_from_plc(self, counts: dict):
+        """Overwrite the local W1 estimate with the PLC's authoritative
+        W1Count[1..2] (Wood/Metal).
 
-    # ---- generic piece tracking (sub-parts staged via Transfer Cell) ----
-
-    def w1_add_piece(self, name, qty=1):
-        """Add an arbitrary piece type to the W1 model (e.g. a sub-part
-        RtopW/LegM brought back from W2 through the Transfer Cell)."""
+        This is the fix for the desync described in the brief: when the MES
+        dispatches an order to a cell, it optimistically debits its local W1
+        model — but if that cell's WarehouseOut conveyors are full, no raw
+        piece actually leaves W1, so the order sits queued and the physical
+        W1 still holds the material. The PLC's W1Count only drops when a piece
+        REALLY exits W1 (WarehouseOut Receive_Workpiece_Data), so periodically
+        snapping the local model back to it stops the MES from believing it
+        consumed material it never did, and lets a stalled order's material
+        be counted as available again once the order finally starts.
+        """
+        if not counts:
+            return
         with self._w1_lock:
-            self._w1_local[name] = self._w1_local.get(name, 0) + qty
-            print(f"[w1] +{qty} {name} (now {self._w1_local.get(name)})")
-
-    def w1_has(self, name, qty=1) -> bool:
-        with self._w1_lock:
-            return self._w1_local.get(name, 0) >= qty
+            changed = (self._w1_local != counts)
+            self._w1_local = {"Wood": int(counts.get("Wood", 0)),
+                              "Metal": int(counts.get("Metal", 0))}
+            if changed:
+                print(f"[w1] PLC sync -> wood:{self._w1_local['Wood']} "
+                      f"metal:{self._w1_local['Metal']}")
 
     # ---- MQTT plumbing -------------------------------------------------
 
@@ -110,6 +113,8 @@ class MESMqtt:
         client.subscribe(TOPIC_MATERIAL_LOAD_WOOD)
         client.subscribe(TOPIC_MATERIAL_LOAD_METAL)
         client.subscribe(TOPIC_PRODUCTION_ORDERS)
+        client.subscribe(TOPIC_DELIVERY_ORDERS)
+        client.subscribe(TOPIC_END_OF_DAY)
 
     def _on_message(self, client, userdata, msg):
         if not msg.payload:
@@ -132,6 +137,36 @@ class MESMqtt:
             self._handle_material_load(payload)
         elif msg.topic == TOPIC_PRODUCTION_ORDERS:
             self._handle_production_orders(payload)
+        elif msg.topic == TOPIC_DELIVERY_ORDERS:
+            self._handle_delivery_orders(payload)
+        elif msg.topic == TOPIC_END_OF_DAY:
+            self._handle_end_of_day(payload)
+
+    # ---- delivery / unloading ------------------------------------------
+
+    def _handle_delivery_orders(self, p):
+        """ERP delivery order: place these finished pieces on the docks
+        during the day. Dispatched to the unloader on the asyncio loop."""
+        if self.unloader is None:
+            print("[mqtt] delivery_orders received but no unloader wired")
+            return
+        items = p.get("items", [])
+        if not items:
+            return
+        print(f"[mqtt] delivery_orders: {len(items)} item(s) "
+              f"for sim_day {p.get('sim_day')}")
+        asyncio.run_coroutine_threadsafe(
+            self.unloader.handle_delivery_order(items), self.loop)
+
+    def _handle_end_of_day(self, p):
+        """ERP end-of-day notification: discharge every loaded dock."""
+        if self.unloader is None:
+            print("[mqtt] end_of_day received but no unloader wired")
+            return
+        print(f"[mqtt] end_of_day (sim_day {p.get('sim_day')}): "
+              f"discharging docks")
+        asyncio.run_coroutine_threadsafe(
+            self.unloader.discharge_all(), self.loop)
 
     # ---- material_load -------------------------------------------------
 
@@ -209,15 +244,25 @@ class MESMqtt:
     def _handle_production_orders(self, p):
         items = p.get("items", [])
         order_id = p.get("order_id")
-        total = 0
+        queued = total = 0
+        # Safety net (v3 Bug 8B): never let the queue grow past MAX_QUEUED.
+        depth = len(queued_pieces())
         for it in items:
             qty = int(it.get("quantity", 1))
             total += qty
             for _ in range(qty):
+                if depth + queued >= MAX_QUEUED:
+                    print(f"[mqtt] MES queue at cap ({MAX_QUEUED}); "
+                          f"dropping remaining production order pieces "
+                          f"({total - queued} not queued)")
+                    print(f"[mqtt] queued {queued}/{total} pieces "
+                          f"from production_orders")
+                    return
                 enqueue_piece(order_id=it.get("order_id") or order_id,
                               order_line_id=it.get("order_line_id"),
                               piece_type=it["piece_type"])
-        print(f"[mqtt] queued {total} pieces from production_orders")
+                queued += 1
+        print(f"[mqtt] queued {queued} pieces from production_orders")
 
     # ---- status publishing ---------------------------------------------
 
