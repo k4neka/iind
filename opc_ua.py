@@ -5,7 +5,7 @@ from opcua import Client, ua
 # --- CONFIGURAÇÕES OPC-UA ---
 # Altera a porta para 4840 ou 1217, dependendo da tua configuração no CODESYS
 # --- CONFIGURAÇÕES OPC-UA ---
-OPC_URL = "opc.tcp://172.25.128.1:4840"
+OPC_URL = "opc.tcp://172.21.96.1:4840"
 # Prefixo típico do CODESYS. Pode variar dependendo do nome da tua aplicação!
 # Usa o UaExpert para copiar o NodeId exato se este der erro "BadNodeIdUnknown"
 PREFIX = "ns=4;s=|var|CODESYS Control Win V3 x64.Application.GVL."

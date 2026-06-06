@@ -16,13 +16,18 @@ fi
 # shellcheck disable=SC1090
 source "$VENV_DIR/bin/activate"
 
-echo "[erp] upgrading pip..."
-pip install --quiet --upgrade pip
+echo "[erp] ensuring venv packages (pip upgrade optional)..."
+if [ "${SKIP_PIP_UPGRADE:-0}" != "1" ]; then
+    echo "[erp] attempting pip upgrade (will continue if blocked)..."
+    python3 -m pip install --quiet --upgrade pip || \
+        echo "[erp] pip upgrade skipped or failed (platform-managed)"
+fi
 
 if [ -f "requirements.txt" ]; then
-    echo "[erp] installing requirements..."
-    pip install --quiet -r requirements.txt
+    echo "[erp] installing requirements (if missing)..."
+    python3 -m pip install --quiet -r requirements.txt || \
+        echo "[erp] requirements install skipped or partially failed"
 fi
 
 echo "[erp] starting ERP (main.py)..."
-exec python main.py
+exec python3 main.py

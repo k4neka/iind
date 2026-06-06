@@ -17,12 +17,12 @@ fi
 source "$VENV_DIR/bin/activate"
 
 echo "[mes] upgrading pip..."
-pip install --quiet --upgrade pip
+python3 -m pip install --quiet --upgrade pip
 
 if [ -f "requirements.txt" ]; then
     echo "[mes] installing requirements..."
-    pip install --quiet -r requirements.txt
+    python3 -m pip install --quiet -r requirements.txt
 fi
 
 echo "[mes] starting MES (main.py)..."
-exec python main.py
+exec python3 main.py

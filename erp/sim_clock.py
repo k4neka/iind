@@ -9,7 +9,9 @@ from database import set_state, get_state
 class SimClock:
     def __init__(self):
         self._start_real = time.time()
-        self._base_day = int(get_state("sim_base_day", 0) or 0)
+        val = get_state("sim_base_day", 0)
+        self._base_day = int(val if val is not None else 0)
+        print(f"[clock] Initializing: base_day={self._base_day} (from DB: {val})")
         set_state("sim_base_day", self._base_day)
         self._listeners = []
         self._last_day = self.current_day()
