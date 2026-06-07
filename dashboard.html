@@ -118,8 +118,8 @@
         <div class="kpi-sub">WAREHOUSE (W1/W2)</div>
       </div>
       <div class="kpi-card" style="border-color:#f59e0b33">
-        <div class="kpi-val" style="color:var(--amber)" id="kpi-cost">0.00€</div>
-        <div class="kpi-sub">EST. PRODUCTION REVENUE</div>
+        <div class="kpi-val" style="color:var(--amber)" id="kpi-profit">0.00€</div>
+        <div class="kpi-sub">NET PROFIT (REVENUE - EXPENSES)</div>
       </div>
     </div>
 
@@ -129,14 +129,16 @@
         <table>
           <thead>
             <tr>
-              <th>ORDER ID</th>
-              <th>TOTAL</th>
-              <th>PRODUCED</th>
-              <th>PENDING</th>
+              <th>ORDER</th>
+              <th>QTY</th>
+              <th>DONE</th>
+              <th>LEFT</th>
               <th>PROGRESS</th>
+              <th>DURATION</th>
               <th>STATUS</th>
             </tr>
           </thead>
+
           <tbody id="orders-body"></tbody>
         </table>
       </div>
@@ -146,15 +148,6 @@
   <!-- ERP TAB VIEW -->
   <div id="tab-erp" class="hidden">
     <div style="display:grid; grid-template-columns: 1fr 1.5fr; gap:20px;">
-      <div>
-        <div class="panel">
-          <div class="panel-title">Global Inventory</div>
-          <div class="inv-grid" id="inv-grid">
-            <!-- Dynamic items -->
-          </div>
-        </div>
-      </div>
-      
       <div>
         <div class="panel">
           <div class="panel-title">Purchase Plan (Supply Chain)</div>
@@ -173,6 +166,30 @@
           </table>
         </div>
       </div>
+      
+      <div>
+        <div class="panel">
+          <div class="panel-title">Factory Economy (P&L)</div>
+          <div style="display:grid; grid-template-columns: 1fr 1fr; gap:10px;">
+            <div class="inv-item" style="border-color:var(--green)">
+              <div class="inv-name">Gross Revenue</div>
+              <div class="inv-val" id="fin-revenue" style="color:var(--green)">0.00€</div>
+            </div>
+            <div class="inv-item" style="border-color:var(--red)">
+              <div class="inv-name">Material Costs</div>
+              <div class="inv-val" id="fin-costs" style="color:var(--red)">0.00€</div>
+            </div>
+            <div class="inv-item" style="border-color:var(--red)">
+              <div class="inv-name">Late Penalties</div>
+              <div class="inv-val" id="fin-penalties" style="color:var(--red)">0.00€</div>
+            </div>
+            <div class="inv-item" style="border-color:var(--amber)">
+              <div class="inv-name">Net Profit</div>
+              <div class="inv-val" id="fin-profit" style="color:var(--amber)">0.00€</div>
+            </div>
+          </div>
+        </div>
+      </div>
     </div>
   </div>
 </div>
@@ -180,6 +197,7 @@
 <script>
 let mqttClient = null;
 let cellChart = null;
+const orderStartTimes = {}; // Cache to survive table rebuilds
 
 function setStatus(cls, text) {
   document.getElementById('ws-dot').className = cls;
@@ -230,66 +248,118 @@ function connectMQTT() {
 }
 
 function updateDashboard(data) {
-  document.getElementById('last-update').textContent = `UPDT: ${new Date().toLocaleTimeString()}`;
-  document.getElementById('val-day').textContent = data.current_day;
-  
-  // KPI Warehouses
-  document.getElementById('kpi-w1').textContent = data.warehouse.w1;
-  document.getElementById('kpi-w2').textContent = data.warehouse.w2;
-
-  // Orders Table
-  const tbody = document.getElementById('orders-body');
-  let totalPieces = 0;
-  let totalCost = 0;
-  tbody.innerHTML = (data.orders || []).map(o => {
-    totalPieces += parseInt(o.produced || 0);
-    totalCost += parseFloat(o.total_cost || 0);
-    const produced = parseInt(o.produced || 0);
-    const total = parseInt(o.total_pieces || 1);
-    const pct = (produced / total) * 100;
+  try {
+    document.getElementById('last-update').textContent = `UPDT: ${new Date().toLocaleTimeString()}`;
+    document.getElementById('val-day').textContent = data.current_day || 0;
     
-    return `<tr>
-      <td style="font-family:var(--font-mono);color:var(--text1)">ORD-${o.order_id}</td>
-      <td>${total}</td>
-      <td style="color:var(--green)">${produced}</td>
-      <td style="color:var(--red)">${o.pending}</td>
-      <td>
-        <div style="font-size:10px; margin-bottom:2px;">${pct.toFixed(0)}%</div>
-        <div class="pct-bar"><div class="pct-fill" style="width:${pct}%"></div></div>
-      </td>
-      <td style="font-size:10px; color:var(--text3)">${o.status}</td>
-    </tr>`;
-  }).join('');
-  
-  document.getElementById('kpi-orders').textContent = (data.orders || []).length;
-  document.getElementById('kpi-pieces').textContent = totalPieces;
-  document.getElementById('kpi-cost').textContent = totalCost.toFixed(2) + "€";
+    // KPI Warehouses
+    if (data.warehouse) {
+      document.getElementById('kpi-w1').textContent = data.warehouse.w1 ?? 0;
+      document.getElementById('kpi-w2').textContent = data.warehouse.w2 ?? 0;
+    }
 
-  // ERP Inventory Grid
-  const invGrid = document.getElementById('inv-grid');
-  invGrid.innerHTML = Object.entries(data.inventory || {}).map(([name, val]) => `
-    <div class="inv-item">
-      <div class="inv-name">${name}</div>
-      <div class="inv-val">${val}</div>
-    </div>
-  `).join('');
+    // Orders Table
+    const tbody = document.getElementById('orders-body');
+    let totalPieces = 0;
+    if (data.orders) {
+      tbody.innerHTML = data.orders.map(o => {
+        totalPieces += parseInt(o.produced || 0);
+        const produced = parseInt(o.produced || 0);
+        const total = parseInt(o.total_pieces || 1);
+        const pct = (produced / total) * 100;
+        const isDone = pct >= 100;
+        const displayStatus = isDone ? 'COMPLETED' : o.status;
+        const statusColor = isDone ? 'var(--green)' : 'var(--text3)';
+        
+        // Robust Date Parsing
+        let startMs = 0;
+        if (o.started_at) {
+          const d = new Date(o.started_at);
+          if (!isNaN(d.getTime())) startMs = d.getTime();
+        }
+        
+        let endMs = 0;
+        if (isDone && o.finished_at) {
+          const d = new Date(o.finished_at);
+          if (!isNaN(d.getTime())) endMs = d.getTime();
+        }
+        
+        // Client-side cache logic: if we have a valid start time, lock it in
+        if (startMs && !orderStartTimes[o.order_id]) {
+          orderStartTimes[o.order_id] = startMs;
+        }
+        const resolvedStart = orderStartTimes[o.order_id] || startMs;
 
-  // ERP Purchase Table
-  const pbody = document.getElementById('purchase-body');
-  pbody.innerHTML = (data.purchases || []).map(p => `
-    <tr>
-      <td>${p.supplier}</td>
-      <td style="color:var(--blue)">${p.material}</td>
-      <td>${p.quantity}</td>
-      <td style="color:var(--amber)">Day ${p.arrival_day}</td>
-      <td>${parseFloat(p.cost).toFixed(2)}€</td>
-      <td><span style="font-size:10px; padding:2px 6px; border-radius:3px; background:${p.placed?'var(--green)':'var(--bg4)'}; color:${p.placed?'var(--bg0)':'var(--text3)'}">
-        ${p.placed?'ARRIVED':'IN TRANSIT'}</span>
-      </td>
-    </tr>
-  `).join('');
+        return `<tr class="order-row" data-start="${resolvedStart}" data-end="${endMs}" data-done="${isDone}">
+          <td style="font-family:var(--font-mono);color:var(--text1)">ORD-${o.order_id}</td>
+          <td>${total}</td>
+          <td style="color:var(--green)">${produced}</td>
+          <td style="color:var(--red)">${o.pending}</td>
+          <td>
+            <div style="font-size:10px; margin-bottom:2px;">${pct.toFixed(0)}%</div>
+            <div class="pct-bar"><div class="pct-fill" style="width:${pct}%"></div></div>
+          </td>
+          <td class="duration-cell" style="font-family:var(--font-mono);font-size:11px;">--</td>
+          <td style="font-size:10px; color:${statusColor}">${displayStatus}</td>
+        </tr>`;
+      }).join('');
+      
+      updateTimers();
+      document.getElementById('kpi-orders').textContent = data.orders.length;
+      document.getElementById('kpi-pieces').textContent = totalPieces;
+    }
+
+    // Financials
+    if (data.financials) {
+      document.getElementById('kpi-profit').textContent = (data.financials.profit || 0).toFixed(2) + "€";
+      document.getElementById('fin-revenue').textContent = (data.financials.revenue || 0).toFixed(2) + "€";
+      document.getElementById('fin-costs').textContent = (data.financials.mat_cost || 0).toFixed(2) + "€";
+      document.getElementById('fin-penalties').textContent = (data.financials.penalties || 0).toFixed(2) + "€";
+      document.getElementById('fin-profit').textContent = (data.financials.profit || 0).toFixed(2) + "€";
+    }
+
+    // ERP Purchase Table
+    const pbody = document.getElementById('purchase-body');
+    if (data.purchases) {
+      pbody.innerHTML = data.purchases.map(p => `
+        <tr>
+          <td>${p.supplier}</td>
+          <td style="color:var(--blue)">${p.material}</td>
+          <td>${p.quantity}</td>
+          <td style="color:var(--amber)">Day ${p.arrival_day}</td>
+          <td>${parseFloat(p.cost || 0).toFixed(2)}€</td>
+          <td><span style="font-size:10px; padding:2px 6px; border-radius:3px; background:${p.placed?'var(--green)':'var(--bg4)'}; color:${p.placed?'var(--bg0)':'var(--text3)'}">
+            ${p.placed?'ARRIVED':'IN TRANSIT'}</span>
+          </td>
+        </tr>
+      `).join('');
+    }
+  } catch (err) {
+    console.error("Dashboard update failed:", err);
+  }
 }
 
+function updateTimers() {
+  document.querySelectorAll('.order-row').forEach(row => {
+    const start = parseInt(row.dataset.start);
+    const end = parseInt(row.dataset.end);
+    const isDone = row.dataset.done === "true";
+    const cell = row.querySelector('.duration-cell');
+    
+    if (!start) {
+      cell.textContent = "--";
+      return;
+    }
+    
+    const now = (isDone && end) ? end : Date.now();
+    const diffMs = Math.max(0, now - start);
+    const mins = Math.floor(diffMs / 60000);
+    const secs = Math.floor((diffMs % 60000) / 1000);
+    cell.textContent = `${mins}m ${secs}s`;
+  });
+}
+
+setInterval(updateTimers, 1000);
 setTimeout(connectMQTT, 500);
 </script>
 </body>

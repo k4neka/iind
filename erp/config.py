@@ -70,6 +70,18 @@ SUPPLIERS = {
 # --- Final products clients can order ---
 FINAL_PRODUCTS = {"RWW", "SWW", "RWM", "SWM", "RMM", "SMM"}
 
+# --- Sales Prices (Revenue) ---
+# COMPETITIVE STRATEGY: Low prices to make Supplier A a safe 5-10€ profit 
+# and make Supplier B a high-risk/high-reward gamble.
+PRODUCT_PRICES = {
+    "RWW": 35.0,
+    "RWM": 45.0,
+    "RMM": 50.0,
+    "SWW": 40.0,
+    "SWM": 50.0,
+    "SMM": 55.0,
+}
+
 # --- Bill of materials ---
 BOM = {
     "RWW": {"Wood": 3, "Metal": 0},

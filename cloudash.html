@@ -1,0 +1,700 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>IIoT Cloud Dashboard – Flexible Production Line</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Rajdhani:wght@400;600;700&family=JetBrains+Mono:wght@400;700&family=DM+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
+<style>
+  *,*::before,*::after{box-sizing:border-box;margin:0;padding:0;}
+  :root{
+    --bg0:#060b12;--bg1:#0a0f1a;--bg2:#0d1117;--bg3:#111827;--bg4:#1a2332;
+    --border:#1f2937;--border2:#1a2030;
+    --text1:#f1f5f9;--text2:#94a3b8;--text3:#64748b;
+    --amber:#f59e0b;--amber2:#fbbf24;--blue:#38bdf8;--green:#4ade80;--purple:#a78bfa;--red:#ef4444;
+    --font-head:'Rajdhani',sans-serif;--font-mono:'JetBrains Mono',monospace;--font-body:'DM Sans',sans-serif;
+  }
+  body{background:var(--bg0);color:var(--text1);font-family:var(--font-body);font-size:13px;min-height:100vh;}
+  #flash-overlay{position:fixed;inset:0;pointer-events:none;z-index:100;background:rgba(245,158,11,.04);opacity:0;transition:opacity .3s;}
+  #header{position:sticky;top:0;z-index:50;background:var(--bg1);border-bottom:1px solid #1a2540;height:52px;display:flex;align-items:center;justify-content:space-between;padding:0 24px;}
+  #logo{font-family:var(--font-head);font-size:20px;font-weight:700;letter-spacing:3px;color:var(--amber);display:flex;align-items:center;gap:8px;}
+  #status-bar{display:flex;align-items:center;gap:20px;font-size:11px;color:var(--text3);}
+  #sim-day{font-family:var(--font-mono);color:var(--blue);font-weight:700;font-size:14px;}
+  #ws-dot{width:8px;height:8px;border-radius:50%;background:var(--text3);display:inline-block;}
+  #ws-dot.live{background:var(--green);animation:pulse-dot 1.4s ease-in-out infinite;}
+  #ws-dot.error{background:var(--red);}
+  #ws-label{font-size:11px;color:var(--text3);letter-spacing:1px;}
+  #ws-label.live{color:var(--green);}#ws-label.error{color:var(--red);}
+  @keyframes pulse-dot{0%,100%{opacity:1}50%{opacity:.3}}
+  #content{padding:20px 24px;max-width:1400px;margin:0 auto;}
+  #kpi-row{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:20px;}
+  .kpi-card{background:var(--bg2);border-radius:8px;padding:14px 18px;}
+  .kpi-val{font-family:var(--font-head);font-size:32px;font-weight:700;line-height:1;}
+  .kpi-sub{font-size:10px;color:var(--text3);letter-spacing:1px;margin-top:4px;}
+  #tabs{display:flex;gap:4px;margin-bottom:20px;}
+  .tab-btn{padding:7px 18px;border-radius:5px;font-size:12px;cursor:pointer;font-family:var(--font-head);font-weight:600;letter-spacing:1px;border:1px solid var(--border);background:var(--bg3);color:var(--text3);transition:all .15s;}
+  .tab-btn.active{background:var(--amber);color:var(--bg0);border-color:var(--amber);}
+  .tab-btn:hover:not(.active){border-color:#374151;color:var(--text2);}
+  .tab-panel{display:none;}.tab-panel.active{display:block;}
+  .cells-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:12px;}
+  .cell-panel{background:var(--bg0);border:1px solid var(--border);border-radius:8px;padding:14px;}
+  .cell-title{font-family:var(--font-head);font-size:18px;font-weight:700;color:var(--amber);letter-spacing:2px;margin-bottom:10px;display:flex;justify-content:space-between;align-items:center;}
+  .cell-title span{font-size:10px;color:var(--text3);letter-spacing:1px;}
+  .machines-grid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;}
+  .machine-card{background:var(--bg3);border:1px solid var(--border);border-radius:6px;padding:10px 12px;cursor:pointer;transition:all .18s;position:relative;overflow:hidden;}
+  .machine-card:hover{border-color:#374151;}
+  .machine-card.selected{background:var(--bg4);border-color:var(--amber);}
+  .machine-card.selected::before{content:'';position:absolute;top:0;left:0;right:0;height:2px;background:linear-gradient(90deg,var(--amber),var(--amber2));}
+  .mc-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;}
+  .mc-id{font-family:var(--font-head);font-size:15px;font-weight:700;color:var(--text1);letter-spacing:1px;}
+  .mc-status{font-size:9px;padding:2px 6px;border-radius:3px;letter-spacing:1px;border:1px solid;}
+  .mc-status.running{border-color:var(--green);color:var(--green);}
+  .mc-status.idle{border-color:var(--text2);color:var(--text2);}
+  .mc-label{font-size:10px;color:var(--text3);margin-bottom:4px;letter-spacing:.5px;}
+  .mc-tool-badge{display:inline-flex;align-items:center;gap:6px;margin-bottom:8px;}
+  .tool-chip{border-radius:4px;padding:2px 8px;font-size:12px;font-family:var(--font-mono);font-weight:700;border:1px solid;}
+  .mc-tool-op{font-size:10px;color:var(--text2);}
+  .tool-bar-row{margin-bottom:3px;}
+  .tool-bar-labels{display:flex;justify-content:space-between;margin-bottom:1px;}
+  .tool-bar-id{font-size:9px;font-family:monospace;}
+  .tool-bar-val{font-size:9px;color:var(--text3);}
+  .tool-bar-track{height:3px;background:var(--border);border-radius:2px;}
+  .tool-bar-fill{height:100%;border-radius:2px;transition:width .5s;}
+  #machine-selector{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:16px;}
+  .msel-btn{padding:5px 12px;border-radius:4px;font-size:12px;cursor:pointer;font-family:monospace;font-weight:700;border:1px solid var(--border);background:var(--bg3);color:var(--text3);transition:all .15s;}
+  .msel-btn.active{background:var(--amber);color:var(--bg0);border-color:var(--amber);}
+  .detail-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px;}
+  .panel{background:var(--bg2);border:1px solid var(--border);border-radius:8px;padding:16px;}
+  .panel-title{font-family:var(--font-head);font-size:13px;font-weight:600;color:var(--text3);letter-spacing:2px;margin-bottom:12px;text-transform:uppercase;}
+  .info-grid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;margin-bottom:16px;}
+  .info-box{background:var(--bg3);border:1px solid var(--border);border-radius:6px;padding:10px 16px;}
+  .info-box-label{font-size:10px;color:var(--text3);letter-spacing:1px;margin-bottom:4px;}
+  .info-box-val{font-family:var(--font-head);font-size:20px;font-weight:700;}
+  .tool-detail-row{border-radius:6px;padding:10px 14px;margin-bottom:8px;border:1px solid;}
+  .tdr-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;}
+  .tdr-left{display:flex;align-items:center;gap:8px;}
+  .tdr-id{font-family:var(--font-mono);font-size:13px;font-weight:700;}
+  .tdr-op{font-size:11px;color:var(--text2);}
+  .tdr-mounted-badge{font-size:9px;padding:1px 6px;border-radius:3px;letter-spacing:1px;border:1px solid;}
+  .tdr-min{font-family:monospace;font-size:12px;color:var(--text3);}
+  .tdr-bar-track{height:4px;background:var(--border);border-radius:2px;}
+  .tdr-bar-fill{height:100%;border-radius:2px;transition:width .5s;}
+  .stats-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px;}
+  .full-span{grid-column:1/-1;}
+  .matrix-wrap{overflow-x:auto;}
+  .matrix-table{width:100%;border-collapse:collapse;font-size:12px;}
+  .matrix-table th{padding:8px 12px;text-align:left;color:var(--text3);font-weight:600;letter-spacing:1px;font-size:10px;border-bottom:1px solid var(--border);white-space:nowrap;}
+  .matrix-table td{padding:7px 8px;border-bottom:1px solid var(--border2);}
+  .matrix-table tr{cursor:pointer;transition:background .1s;}
+  .matrix-table tr:hover{background:var(--bg4)!important;}
+  .log-entry{background:var(--bg1);border:1px solid var(--border2);border-radius:4px;padding:8px 12px;display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;}
+  .log-topic{font-family:var(--font-mono);font-size:10px;color:var(--text3);}
+  .log-topic span{color:var(--blue);}
+  .log-time{font-size:10px;color:#374151;}
+  .payload-box{margin-top:12px;padding:10px 14px;background:var(--bg1);border-radius:6px;border:1px solid var(--border2);}
+  .payload-pre{font-family:var(--font-mono);font-size:10px;color:var(--text2);white-space:pre-wrap;max-height:200px;overflow-y:auto;}
+  .chart-wrap{position:relative;width:100%;height:200px;}
+  .chart-wrap-lg{position:relative;width:100%;height:240px;}
+  .chart-controls{display:flex;gap:10px;margin-bottom:10px;align-items:center;background:var(--bg3);padding:8px 12px;border-radius:6px;border:1px solid var(--border2);}
+  .chart-select{background:var(--bg0);border:1px solid var(--border);color:var(--text1);font-family:var(--font-head);font-size:12px;padding:4px 8px;border-radius:4px;cursor:pointer;}
+  .conn-form{display:flex;flex-direction:column;gap:10px;padding:16px;background:var(--bg2);border:1px solid var(--border);border-radius:8px;margin-bottom:20px;}
+  .conn-row{display:flex;align-items:center;gap:10px;flex-wrap:wrap;}
+  .conn-label{font-size:11px;color:var(--text3);width:80px;letter-spacing:1px;}
+  .conn-input{background:var(--bg3);border:1px solid var(--border);color:var(--text1);padding:6px 10px;border-radius:4px;font-family:var(--font-mono);font-size:12px;width:260px;}
+  .conn-btn{padding:7px 20px;background:var(--amber);color:var(--bg0);border:none;border-radius:4px;font-family:var(--font-head);font-weight:700;font-size:13px;letter-spacing:1px;cursor:pointer;}
+  .conn-btn:hover{background:var(--amber2);}
+  .conn-btn.stop{background:#374151;color:var(--text2);}
+  #conn-status{font-size:11px;color:var(--text3);font-family:var(--font-mono);}
+</style>
+</head>
+<body>
+<div id="flash-overlay"></div>
+<div id="header">
+  <div id="logo">
+    <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#f59e0b" stroke-width="2">
+      <path d="M12 2L2 7l10 5 10-5-10-5z"/><path d="M2 17l10 5 10-5"/><path d="M2 12l10 5 10-5"/>
+    </svg>
+    IIoT CLOUD DASHBOARD
+  </div>
+  <div id="status-bar">
+    <span id="ws-dot"></span>
+    <span id="ws-label">DISCONNECTED</span>
+    <span id="sim-day">SESSION: 0s</span>
+    <span id="last-update">LAST UPDATE: --:--:--</span>
+    <span style="color:#374151">|</span>
+    <span>FLEXIBLE PRODUCTION LINE · FEUP 2026</span>
+  </div>
+</div>
+
+<div id="content">
+  <div class="conn-form">
+    <div style="font-family:var(--font-head);font-size:14px;color:var(--amber);letter-spacing:2px;margin-bottom:4px;">THINGSBOARD CONNECTION — REST API</div>
+    <div class="conn-row">
+      <span class="conn-label">TB HOST</span>
+      <input class="conn-input" id="inp-host" value="10.227.113.2:8080"/>
+      <span class="conn-label" style="width:70px">USERNAME</span>
+      <input class="conn-input" id="inp-user" value="II2526_A02_D@thingsboard.org"/>
+    </div>
+    <div class="conn-row">
+      <span class="conn-label">PASSWORD</span>
+      <input class="conn-input" id="inp-pass" type="password" value="admin123"/>
+      <span class="conn-label" style="width:70px">DEVICE ID</span>
+      <input class="conn-input" id="inp-device" value="16984e30-532d-11f1-b252-cb2ae3ea6faf"/>
+    </div>
+    <div class="conn-row">
+      <button class="conn-btn" id="btn-connect" onclick="startPolling()">CONNECT & POLL</button>
+      <button class="conn-btn stop" id="btn-stop" onclick="stopPolling()" style="display:none">STOP</button>
+      <span id="conn-status" style="margin-left:10px">Not connected</span>
+    </div>
+  </div>
+
+  <div id="kpi-row">
+    <div class="kpi-card" style="border:1px solid #4ade8033">
+      <div class="kpi-val" style="color:var(--green)"><span id="kpi-running">0</span><span style="font-size:16px;color:var(--text3)">/12</span></div>
+      <div class="kpi-sub">MACHINES RUNNING</div>
+    </div>
+    <div class="kpi-card" style="border:1px solid #f59e0b33">
+      <div class="kpi-val" style="color:var(--amber)"><span id="kpi-usage">0</span><span style="font-size:16px;color:var(--text3)">s</span></div>
+      <div class="kpi-sub">TOTAL TOOL USAGE (PLC)</div>
+    </div>
+    <div class="kpi-card" style="border:1px solid #38bdf833">
+      <div class="kpi-val" style="color:var(--blue)" id="kpi-polls">0</div>
+      <div class="kpi-sub">POLLS RECEIVED</div>
+    </div>
+    <div class="kpi-card" style="border:1px solid #a78bfa33">
+      <div class="kpi-val" style="color:var(--purple)">10<span style="font-size:16px;color:var(--text3)"> TOOLS</span></div>
+      <div class="kpi-sub">UNIQUE TOOLS TRACKED</div>
+    </div>
+  </div>
+
+  <div id="tabs">
+    <button class="tab-btn active" data-tab="overview">OVERVIEW</button>
+    <button class="tab-btn" data-tab="detail">DETAIL</button>
+    <button class="tab-btn" data-tab="stats">STATS</button>
+  </div>
+
+  <div id="tab-overview" class="tab-panel active">
+    <div class="cells-grid" id="cells-top"></div>
+    <div class="cells-grid" id="cells-bot"></div>
+  </div>
+
+  <div id="tab-detail" class="tab-panel">
+    <div id="machine-selector"></div>
+    <div class="detail-grid">
+      <div class="panel" id="detail-left"></div>
+      <div class="panel" id="detail-right">
+        <div class="panel-title" id="detail-chart-title">Tool Usage History — from PLC</div>
+        <div class="chart-controls">
+          <span style="font-size:10px;color:var(--text3)">TOOL:</span>
+          <select class="chart-select" id="sel-tool-detail" onchange="state.toolFilter=this.value;renderAll()">
+            <option value="ALL">ALL TOOLS</option>
+            <option value="T1">T1</option><option value="T2">T2</option><option value="T3">T3</option>
+            <option value="T4">T4</option><option value="T5">T5</option><option value="T6">T6</option>
+            <option value="T8">T8</option><option value="T9">T9</option><option value="T10">T10</option><option value="T11">T11</option>
+          </select>
+          <span style="font-size:10px;color:var(--text3);margin-left:10px">WINDOW:</span>
+          <select class="chart-select" id="sel-window-detail" onchange="state.timeWindow=this.value;renderAll()">
+            <option value="ALL">ALL TIME</option>
+            <option value="10">LAST 10 MIN</option>
+            <option value="5">LAST 5 MIN</option>
+            <option value="1">LAST 1 MIN</option>
+          </select>
+        </div>
+        <div class="chart-wrap"><canvas id="historyChart"></canvas></div>
+        <div class="panel-title" style="margin-top:16px">All Tools — Current Usage (sec)</div>
+        <div class="chart-wrap"><canvas id="usageBarChart"></canvas></div>
+      </div>
+    </div>
+  </div>
+
+  <div id="tab-stats" class="tab-panel">
+    <div class="stats-grid">
+      <div class="panel full-span">
+        <div class="panel-title">FULL TOOL STATUS MATRIX</div>
+        <div class="matrix-wrap">
+          <table class="matrix-table">
+            <thead><tr>
+              <th>MACHINE</th><th>CELL</th><th>STATUS</th><th>MOUNTED</th>
+              <th style="color:#f472b6">T1</th><th style="color:#ec4899">T2</th><th style="color:#db2777">T3</th>
+              <th style="color:#38bdf8">T4</th><th style="color:#0ea5e9">T5</th><th style="color:#0284c7">T6</th>
+              <th style="color:#4ade80">T8</th><th style="color:#22c55e">T9</th><th style="color:#a3e635">T10</th><th style="color:#84cc16">T11</th>
+            </tr></thead>
+            <tbody id="matrix-body"></tbody>
+          </table>
+        </div>
+      </div>
+      <div class="panel">
+        <!-- KEY CHART: graphical evolution of tool usage over time — data comes from PLC via ThingsBoard -->
+        <div class="panel-title">TOOL USAGE EVOLUTION — PLC DATA</div>
+        <div style="font-size:10px;color:var(--text3);margin-bottom:8px;font-family:var(--font-mono)">
+          Each point = one poll from ThingsBoard (every 3s). Values computed on PLC.
+        </div>
+        <div class="chart-controls">
+          <span style="font-size:10px;color:var(--text3)">TOOL:</span>
+          <select class="chart-select" id="sel-tool-global" onchange="state.toolFilter=this.value;renderAll()">
+            <option value="ALL">ALL TOOLS</option>
+            <option value="T1">T1</option><option value="T2">T2</option><option value="T3">T3</option>
+            <option value="T4">T4</option><option value="T5">T5</option><option value="T6">T6</option>
+            <option value="T8">T8</option><option value="T9">T9</option><option value="T10">T10</option><option value="T11">T11</option>
+          </select>
+          <span style="font-size:10px;color:var(--text3);margin-left:10px">WINDOW:</span>
+          <select class="chart-select" id="sel-window-global" onchange="state.timeWindow=this.value;renderAll()">
+            <option value="ALL">ALL TIME</option>
+            <option value="10">LAST 10 MIN</option>
+            <option value="5">LAST 5 MIN</option>
+            <option value="1">LAST 1 MIN</option>
+          </select>
+        </div>
+        <div class="chart-wrap-lg"><canvas id="globalChart"></canvas></div>
+      </div>
+      <div class="panel">
+        <div class="panel-title">LIVE DATA LOG</div>
+        <div id="data-log"></div>
+        <div class="payload-box">
+          <div style="font-family:monospace;font-size:10px;color:var(--green);margin-bottom:6px;">// Latest Payload from ThingsBoard</div>
+          <pre class="payload-pre" id="payload-pre">Waiting for data...</pre>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+/* ══════════════════════════════════════════
+   CONFIG — matches CoDeSys arrMachines
+══════════════════════════════════════════ */
+const MACHINE_CFG = {
+  M1a:{cell:"C1",tools:["T1","T2","T3"]},  M1b:{cell:"C1",tools:["T1","T2","T3"]},  M1c:{cell:"C1",tools:["T8","T9","T11"]},
+  M2a:{cell:"C2",tools:["T1","T2","T3"]},  M2b:{cell:"C2",tools:["T1","T2","T3"]},  M2c:{cell:"C2",tools:["T8","T9","T10"]},
+  M3a:{cell:"C3",tools:["T4","T5","T6"]},  M3b:{cell:"C3",tools:["T4","T5","T6"]},  M3c:{cell:"C3",tools:["T8","T9","T11"]},
+  M4a:{cell:"C4",tools:["T4","T5","T6"]},  M4b:{cell:"C4",tools:["T4","T5","T6"]},  M4c:{cell:"C4",tools:["T8","T9","T10"]},
+};
+const TOOL_INFO = {
+  T1:{op:"RtopW",color:"#f472b6"},  T2:{op:"StopW",color:"#ec4899"},  T3:{op:"LegW",color:"#db2777"},
+  T4:{op:"RtopM",color:"#38bdf8"},  T5:{op:"LegM",color:"#0ea5e9"},   T6:{op:"StopM",color:"#0284c7"},
+  T8:{op:"AssemblyA",color:"#4ade80"}, T9:{op:"AssemblyB",color:"#22c55e"},
+  T10:{op:"LegW/LegM",color:"#a3e635"}, T11:{op:"LegM alt",color:"#84cc16"},
+};
+const ALL_TOOLS = ["T1","T2","T3","T4","T5","T6","T8","T9","T10","T11"];
+const CELLS = ["C1","C2","C3","C4"];
+const DEFAULT_MOUNTED = {M1a:"T1",M1b:"T2",M1c:"T8",M2a:"T1",M2b:"T3",M2c:"T9",M3a:"T4",M3b:"T5",M3c:"T11",M4a:"T6",M4b:"T4",M4c:"T10"};
+
+/* ══════════════════════════════════════════
+   STATE
+══════════════════════════════════════════ */
+let state = {
+  activeTab:"overview", selected:"M1a",
+  sessionSeconds:0, pollCount:0,
+  machines:{},
+  
+  // toolTimeSec[machineId][toolId] = value for specific tool ON specific machine
+  toolTimeSec: {},
+  // toolTimeSecGlobal[toolId] = sum across all machines — used for global charts/KPI
+  toolTimeSecGlobal: {},
+
+  // history: array of {label, timestamp, T1, T2, ...T11}
+  history:[],
+  dataLogs:[],
+  // UI States
+  toolFilter: "ALL", // "ALL" or specific tool ID
+  timeWindow: "ALL", // "ALL", "10", "5", "1" (minutes)
+};
+
+function initState() {
+  for (const [mId,cfg] of Object.entries(MACHINE_CFG)) {
+    state.machines[mId] = {
+      cell:cfg.cell, status:"IDLE", mounted:DEFAULT_MOUNTED[mId],
+      tools:cfg.tools.map(t=>({id:t,color:TOOL_INFO[t].color,op:TOOL_INFO[t].op,usageSec:0,mounted:DEFAULT_MOUNTED[mId]===t}))
+    };
+    state.toolTimeSec[mId] = {};
+    cfg.tools.forEach(t => { state.toolTimeSec[mId][t] = 0; });
+  }
+  ALL_TOOLS.forEach(t=>{ state.toolTimeSecGlobal[t]=0; });
+}
+
+/* ══════════════════════════════════════════
+   RECOMPUTE GLOBAL TOOL TOTALS
+   Sums tool usage across all machines per tool.
+══════════════════════════════════════════ */
+function recomputeGlobalTotals() {
+  ALL_TOOLS.forEach(t => { state.toolTimeSecGlobal[t] = 0; });
+  for (const [mId, toolMap] of Object.entries(state.toolTimeSec)) {
+    for (const [toolId, secs] of Object.entries(toolMap)) {
+      if (state.toolTimeSecGlobal[toolId] !== undefined) {
+        state.toolTimeSecGlobal[toolId] += secs;
+      }
+    }
+  }
+}
+
+/* ══════════════════════════════════════════
+   THINGSBOARD REST POLLING
+══════════════════════════════════════════ */
+let jwtToken=null, pollTimer=null;
+
+async function startPolling() {
+  const host=document.getElementById('inp-host').value.trim();
+  const user=document.getElementById('inp-user').value.trim();
+  const pass=document.getElementById('inp-pass').value.trim();
+  const dev =document.getElementById('inp-device').value.trim();
+  document.getElementById('conn-status').textContent='Authenticating...';
+  try {
+    const r = await fetch(`http://${host}/api/auth/login`,{
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({username:user,password:pass})
+    });
+    if(!r.ok){
+      setStatus('error',`Auth failed ${r.status}`,'AUTH FAILED'); return;
+    }
+    jwtToken=(await r.json()).token;
+    setStatus('live','Authenticated — polling every 3s','TB LIVE (POLLING)');
+    document.getElementById('btn-connect').style.display='none';
+    document.getElementById('btn-stop').style.display='inline-block';
+    await fetchTelemetry(host,dev);
+    pollTimer=setInterval(()=>fetchTelemetry(host,dev),3000);
+  } catch(e){ setStatus('error',`Error: ${e.message}`,'CONN ERROR'); }
+}
+
+function stopPolling(){
+  clearInterval(pollTimer); pollTimer=null; jwtToken=null;
+  setStatus('','Stopped','DISCONNECTED');
+  document.getElementById('btn-connect').style.display='inline-block';
+  document.getElementById('btn-stop').style.display='none';
+}
+
+function setStatus(dotClass,statusText,labelText){
+  document.getElementById('ws-dot').className=dotClass;
+  document.getElementById('ws-label').className=dotClass;
+  document.getElementById('ws-label').textContent=labelText;
+  document.getElementById('conn-status').textContent=statusText;
+}
+
+async function fetchTelemetry(host,deviceId){
+  if(!jwtToken) return;
+  try {
+    const r=await fetch(`http://${host}/api/plugins/telemetry/DEVICE/${deviceId}/values/timeseries`,
+      {headers:{'X-Authorization':`Bearer ${jwtToken}`}});
+    if(r.status===401){stopPolling();startPolling();return;}
+    if(!r.ok){document.getElementById('conn-status').textContent=`Fetch error: ${r.status}`;return;}
+    state.pollCount++;
+    document.getElementById('kpi-polls').textContent=state.pollCount;
+    processTelemetry(await r.json());
+  } catch(e){ document.getElementById('conn-status').textContent=`Poll error: ${e.message}`; }
+}
+
+/* ══════════════════════════════════════════
+   PROCESS DATA FROM THINGSBOARD
+   
+   CoDeSys sends two types of payloads:
+   
+   Type A — per machine (12x per cycle):
+     {"M1a_Tool":"T1","M1a_Status":"RUNNING"}
+   
+   Type B — all tool times (1x per cycle, sent by CoDeSys step 30/40):
+     {"T1_Usage_sec":150,"T2_Usage_sec":80,...}
+     THIS IS THE SOURCE OF TRUTH FOR USAGE TIME.
+     When this arrives, a history point is recorded for the chart.
+══════════════════════════════════════════ */
+function processTelemetry(data){
+  let toolTimeUpdated=false;
+
+  for(const [key,valArr] of Object.entries(data)){
+    const raw=Array.isArray(valArr)?valArr[0].value:valArr;
+    const val=String(raw);
+
+    // Type A — Machine Status/Tool
+    const tm=key.match(/^(M\d[abc])_Tool$/i);
+    if(tm){
+      const mId=tm[1];
+      const tid=val.startsWith('T')?val:`T${val}`;
+      if(state.machines[mId]){
+        state.machines[mId].mounted=tid;
+        state.machines[mId].tools.forEach(t=>{t.mounted=(t.id===tid);});
+      }
+    }
+    const sm=key.match(/^(M\d[abc])_Status$/i);
+    if(sm&&state.machines[sm[1]]){
+      state.machines[sm[1]].status=val.toUpperCase().trim();
+    }
+
+    // Type B — Tool Usage (Machine-Prefixed)
+    const um=key.match(/^(M\d[abc])_(T\d+)_Usage_sec$/i);
+    if(um){
+      const mId=um[1];
+      const tid=um[2];
+      const secs=parseInt(val)||0;
+      if(state.toolTimeSec[mId] && state.toolTimeSec[mId][tid]!==undefined){
+        state.toolTimeSec[mId][tid]=secs;
+        // Update usageSec on the machine's tool object for the mini bars
+        if(state.machines[mId]){
+          const t=state.machines[mId].tools.find(x=>x.id===tid);
+          if(t) t.usageSec=secs;
+        }
+        toolTimeUpdated=true;
+      }
+    }
+  }
+
+  if(toolTimeUpdated){
+    recomputeGlobalTotals();
+
+    const now=new Date();
+    const label=`${now.getHours().toString().padStart(2,'0')}:${now.getMinutes().toString().padStart(2,'0')}:${now.getSeconds().toString().padStart(2,'0')}`;
+    const point={label, timestamp: now.getTime()};
+    ALL_TOOLS.forEach(t=>{ point[t]=state.toolTimeSecGlobal[t]||0; });
+    state.history.push(point);
+    if(state.history.length>2000) state.history.shift(); 
+  }
+
+  // Log
+  const keys=Object.keys(data).join(', ');
+  state.dataLogs.unshift({keys,time:new Date().toLocaleTimeString()});
+  if(state.dataLogs.length>6) state.dataLogs.pop();
+
+  document.getElementById('last-update').textContent=`LAST UPDATE: ${new Date().toLocaleTimeString()}`;
+  document.getElementById('payload-pre').textContent=JSON.stringify(
+    Object.fromEntries(Object.entries(data).map(([k,v])=>[k,Array.isArray(v)?v[0].value:v])),null,2);
+
+  document.getElementById('flash-overlay').style.opacity='1';
+  setTimeout(()=>{document.getElementById('flash-overlay').style.opacity='0';},150);
+
+  renderAll();
+}
+
+/* ══════════════════════════════════════════
+   CHARTS
+══════════════════════════════════════════ */
+let historyChart=null,usageBarChart=null,globalChart=null;
+const COPTS={responsive:true,maintainAspectRatio:false,animation:{duration:300},
+  plugins:{legend:{display:false}},
+  scales:{x:{ticks:{color:"#6b7280",font:{size:9},maxRotation:45},grid:{color:"#1f2937"}},
+          y:{ticks:{color:"#6b7280",font:{size:10}},grid:{color:"#1f2937"}}}};
+
+function getFilteredHistory() {
+  if (state.timeWindow === "ALL" || !state.history.length) return state.history;
+  const now = new Date().getTime();
+  const limit = now - (parseInt(state.timeWindow) * 60 * 1000);
+  return state.history.filter(h => h.timestamp >= limit);
+}
+
+function initHistoryChart(){
+  if(state.activeTab!=='detail') return;
+  const ctx=document.getElementById('historyChart').getContext('2d');
+  const mId=state.selected;
+  
+  // Sync UI
+  document.getElementById('sel-tool-detail').value = state.toolFilter;
+  document.getElementById('sel-window-detail').value = state.timeWindow;
+
+  const filteredHistory = getFilteredHistory();
+  
+  // Show global usage history for tools belonging to this machine, filtered by tool selection
+  const datasets=MACHINE_CFG[mId].tools
+    .filter(t => state.toolFilter === "ALL" || state.toolFilter === t)
+    .map(t=>({
+      label:t, data:filteredHistory.map(h=>h[t]??null),
+      borderColor:TOOL_INFO[t].color, backgroundColor:"transparent",
+      borderWidth:2, pointRadius:2, tension:0.3
+    }));
+
+  if(historyChart) historyChart.destroy();
+  historyChart=new Chart(ctx,{type:"line",
+    data:{labels:filteredHistory.map(h=>h.label),datasets},
+    options:{...COPTS,plugins:{
+      legend:{display:true,labels:{color:"#94a3b8",font:{size:10},boxWidth:10}},
+      tooltip:{backgroundColor:"#0d1117",borderColor:"#374151",borderWidth:1,titleColor:"#f59e0b",bodyColor:"#94a3b8"}}}});
+}
+
+function initUsageBarChart(){
+  if(state.activeTab!=='detail') return;
+  const ctx=document.getElementById('usageBarChart').getContext('2d');
+  // Bar chart of ALL tools global usage totals, filtered by tool selection
+  const filteredTools = ALL_TOOLS.filter(t => state.toolFilter === "ALL" || state.toolFilter === t);
+  const labels=filteredTools;
+  const data=filteredTools.map(t=>state.toolTimeSecGlobal[t]||0);
+  const colors=filteredTools.map(t=>TOOL_INFO[t].color+'cc');
+  if(usageBarChart) usageBarChart.destroy();
+  usageBarChart=new Chart(ctx,{type:"bar",
+    data:{labels,datasets:[{data,backgroundColor:colors}]},
+    options:{...COPTS,plugins:{legend:{display:false},
+      tooltip:{backgroundColor:"#0d1117",borderColor:"#374151",borderWidth:1,titleColor:"#f59e0b",bodyColor:"#94a3b8"}}}});
+}
+
+function initGlobalChart(){
+  if(state.activeTab!=='stats') return;
+  const ctx=document.getElementById('globalChart').getContext('2d');
+  
+  // Sync UI
+  document.getElementById('sel-tool-global').value = state.toolFilter;
+  document.getElementById('sel-window-global').value = state.timeWindow;
+
+  const filteredHistory = getFilteredHistory();
+  
+  const displayTools = state.toolFilter === "ALL" ? ALL_TOOLS.slice(0, 6) : [state.toolFilter];
+  const datasets=displayTools.map((t,i)=>({
+    label:t, data:filteredHistory.map(h=>h[t]??null),
+    borderColor:TOOL_INFO[t].color, backgroundColor:TOOL_INFO[t].color+'18',
+    borderWidth:2, pointRadius:1, tension:0.3, fill:false
+  }));
+  if(globalChart) globalChart.destroy();
+  globalChart=new Chart(ctx,{type:"line",
+    data:{labels:filteredHistory.map(h=>h.label),datasets},
+    options:{...COPTS,plugins:{
+      legend:{display:true,labels:{color:"#94a3b8",font:{size:10},boxWidth:10}},
+      tooltip:{backgroundColor:"#0d1117",borderColor:"#374151",borderWidth:1,titleColor:"#f59e0b",bodyColor:"#94a3b8"}}}});
+}
+
+/* ══════════════════════════════════════════
+   RENDER
+══════════════════════════════════════════ */
+function renderKPIs(){
+  const running=Object.values(state.machines).filter(m=>m.status==='RUNNING').length;
+  const total=Object.values(state.toolTimeSecGlobal).reduce((s,v)=>s+v,0);
+  document.getElementById('kpi-running').textContent=running;
+  document.getElementById('kpi-usage').textContent=total;
+}
+
+function machineCardHTML(mId,selected){
+  const m=state.machines[mId];
+  const sc=m.status==='RUNNING'?'running':'idle';
+  const mt=m.tools.find(t=>t.id===m.mounted);
+  const chip=mt?`background:${mt.color}22;border-color:${mt.color};color:${mt.color}`:'';
+  const maxSec=Math.max(...m.tools.map(x=>x.usageSec),1);
+  const bars=m.tools.map(t=>{
+    const w=Math.min(100,(t.usageSec/maxSec)*100).toFixed(1);
+    return `<div class="tool-bar-row">
+      <div class="tool-bar-labels">
+        <span class="tool-bar-id" style="color:${t.mounted?t.color:'#4b5563'}">${t.id}</span>
+        <span class="tool-bar-val">${t.usageSec}s</span>
+      </div>
+      <div class="tool-bar-track"><div class="tool-bar-fill" style="width:${w}%;background:${t.mounted?t.color:'#374151'}"></div></div>
+    </div>`;
+  }).join('');
+  return `<div class="machine-card${selected?' selected':''}" data-mid="${mId}">
+    <div class="mc-header"><span class="mc-id">${mId}</span><span class="mc-status ${sc}">${m.status}</span></div>
+    <div class="mc-label">MOUNTED TOOL</div>
+    <div class="mc-tool-badge">
+      <span class="tool-chip" style="${chip}">${m.mounted}</span>
+      <span class="mc-tool-op">${mt?.op||''}</span>
+    </div>${bars}</div>`;
+}
+
+function renderOverview(){
+  if(state.activeTab!=='overview') return;
+  const top=document.getElementById('cells-top'),bot=document.getElementById('cells-bot');
+  top.innerHTML='';bot.innerHTML='';
+  CELLS.forEach((cellId,i)=>{
+    const mIds=Object.entries(MACHINE_CFG).filter(([,c])=>c.cell===cellId).map(([m])=>m);
+    const run=mIds.filter(m=>state.machines[m]?.status==='RUNNING').length;
+    const p=document.createElement('div');p.className='cell-panel';
+    p.innerHTML=`<div class="cell-title">CELL ${cellId}<span>${run}/3 RUNNING</span></div><div class="machines-grid">${mIds.map(m=>machineCardHTML(m,m===state.selected)).join('')}</div>`;
+    (i<2?top:bot).appendChild(p);
+  });
+  document.querySelectorAll('.machine-card').forEach(c=>c.addEventListener('click',()=>{state.selected=c.dataset.mid;renderAll();}));
+}
+
+function renderDetailLeft(){
+  if(state.activeTab!=='detail') return;
+  const mId=state.selected,m=state.machines[mId];
+  const sc=m.status==='RUNNING'?'var(--green)':'var(--text2)';
+  const mc=TOOL_INFO[m.mounted]?.color||'#fff';
+  const maxSec=Math.max(...m.tools.map(t=>t.usageSec),1);
+  const rows=m.tools.map(t=>{
+    const pct=((t.usageSec/maxSec)*100).toFixed(1);
+    const bc=t.mounted?t.color+'44':'#1f2937',bg=t.mounted?'#1a2332':'var(--bg2)';
+    const badge=t.mounted?`<span class="tdr-mounted-badge" style="background:${t.color}22;border-color:${t.color};color:${t.color}">MOUNTED</span>`:'';
+    const fill=t.mounted?`background:linear-gradient(90deg,${t.color}88,${t.color})`:'background:#374151';
+    return `<div class="tool-detail-row" style="background:${bg};border-color:${bc}">
+      <div class="tdr-header"><div class="tdr-left">
+        <span class="tdr-id" style="color:${t.color}">${t.id}</span>
+        <span class="tdr-op">${t.op}</span>${badge}
+      </div><span class="tdr-min">${t.usageSec} sec</span></div>
+      <div class="tdr-bar-track"><div class="tdr-bar-fill" style="width:${pct}%;${fill}"></div></div>
+    </div>`;
+  }).join('');
+  document.getElementById('detail-left').innerHTML=`
+    <div class="panel-title">Machine Detail — ${mId}</div>
+    <div class="info-grid">
+      <div class="info-box"><div class="info-box-label">STATUS</div><div class="info-box-val" style="color:${sc}">${m.status}</div></div>
+      <div class="info-box"><div class="info-box-label">MOUNTED TOOL</div><div class="info-box-val" style="color:${mc};font-family:var(--font-mono)">${m.mounted}</div></div>
+      <div class="info-box"><div class="info-box-label">CELL</div><div class="info-box-val" style="color:var(--amber)">${m.cell}</div></div>
+    </div>
+    <div class="panel-title">TOOL WAREHOUSE</div>${rows}`;
+}
+
+function renderMachineSelector(){
+  if(state.activeTab!=='detail') return;
+  const sel=document.getElementById('machine-selector');
+  sel.innerHTML=Object.keys(MACHINE_CFG).map(m=>`<button class="msel-btn${m===state.selected?' active':''}" data-mid="${m}">${m}</button>`).join('');
+  sel.querySelectorAll('.msel-btn').forEach(b=>b.addEventListener('click',()=>{state.selected=b.dataset.mid;renderAll();}));
+}
+
+function renderMatrix(){
+  if(state.activeTab!=='stats') return;
+  document.getElementById('matrix-body').innerHTML=Object.entries(state.machines).map(([mId,m],i)=>{
+    const bg=mId===state.selected?'var(--bg4)':i%2===0?'var(--bg1)':'transparent';
+    const sc=m.status==='RUNNING'?'var(--green)':'var(--text3)';
+    const tCells=ALL_TOOLS.map(t=>{
+      const td=m.tools.find(x=>x.id===t);
+      if(!td) return `<td style="text-align:center;color:#1f2937">—</td>`;
+      return `<td style="text-align:center"><span style="font-family:monospace;font-size:11px;color:${td.mounted?TOOL_INFO[t].color:'#374151'};background:${td.mounted?TOOL_INFO[t].color+'18':'transparent'};padding:2px 4px;border-radius:3px">${td.usageSec}s</span></td>`;
+    }).join('');
+    return `<tr data-mid="${mId}" style="background:${bg}">
+      <td style="font-family:var(--font-head);font-size:14px;font-weight:700;color:var(--text1)">${mId===state.selected?'▶ ':''}${mId}</td>
+      <td style="color:var(--amber);font-weight:600">${m.cell}</td>
+      <td><span style="color:${sc};font-size:11px">● ${m.status}</span></td>
+      <td><span style="font-family:monospace;font-weight:700;font-size:12px;color:${TOOL_INFO[m.mounted]?.color}">${m.mounted}</span></td>
+      ${tCells}</tr>`;
+  }).join('');
+  document.querySelectorAll('#matrix-body tr').forEach(r=>r.addEventListener('click',()=>{state.selected=r.dataset.mid;renderAll();}));
+}
+
+function renderDataLog(){
+  if(state.activeTab!=='stats') return;
+  document.getElementById('data-log').innerHTML=state.dataLogs.length===0
+    ?`<div style="padding:10px;color:var(--text3)">Waiting for data...</div>`
+    :state.dataLogs.map(l=>`<div class="log-entry">
+        <span style="font-size:10px;color:var(--green)">●</span>
+        <span class="log-topic" style="margin-left:8px">keys: <span>${l.keys}</span></span>
+        <span class="log-time">${l.time}</span>
+      </div>`).join('');
+}
+
+function renderAll(){
+  renderKPIs();renderOverview();renderMachineSelector();
+  renderDetailLeft();renderMatrix();renderDataLog();
+  if(state.activeTab==='detail'){
+    document.getElementById('detail-chart-title').textContent=`Tool Usage History (PLC) — ${state.selected}`;
+    initHistoryChart();initUsageBarChart();
+  } else if(state.activeTab==='stats') initGlobalChart();
+}
+
+/* ══════════════════════════════════════════
+   TABS
+══════════════════════════════════════════ */
+document.querySelectorAll('.tab-btn').forEach(btn=>btn.addEventListener('click',()=>{
+  document.querySelectorAll('.tab-btn').forEach(b=>b.classList.remove('active'));
+  document.querySelectorAll('.tab-panel').forEach(p=>p.classList.remove('active'));
+  btn.classList.add('active');
+  document.getElementById(`tab-${btn.dataset.tab}`).classList.add('active');
+  state.activeTab=btn.dataset.tab;renderAll();
+}));
+
+/* ══════════════════════════════════════════
+   SESSION TIMER
+══════════════════════════════════════════ */
+setInterval(()=>{
+  state.sessionSeconds++;
+  const m=Math.floor(state.sessionSeconds/60),s=state.sessionSeconds%60;
+  document.getElementById('sim-day').textContent=`SESSION: ${m}m ${s}s`;
+},1000);
+
+/* ══════════════════════════════════════════
+   BOOT
+══════════════════════════════════════════ */
+initState();renderAll();
+</script>
+</body>
+</html>

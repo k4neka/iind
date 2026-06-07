@@ -28,7 +28,8 @@ def init_db():
             nif             BIGINT    NOT NULL,
             order_id        BIGINT    NOT NULL,
             received_day    INTEGER   NOT NULL,
-            status          TEXT      DEFAULT 'PENDING'
+            status          TEXT      DEFAULT 'PENDING',
+            created_at      TIMESTAMPTZ DEFAULT NOW()
         );
 
         CREATE TABLE IF NOT EXISTS order_lines (
