@@ -26,7 +26,8 @@ import json
 import math
 
 from config import (TOOL_CHANGE_TIME_S, TRANSFER_TIME_S,
-                    CELL_HOPS, QUEUE_FACTOR, SECONDS_PER_DAY)
+                    CELL_HOPS, QUEUE_FACTOR, SECONDS_PER_DAY,
+                    TIME_TOLERANCE_S)
 from database import get_state
 
 
@@ -177,11 +178,18 @@ _MIN_SAMPLES = 5
 
 
 def read_timing_stats(piece_type: str, cell: int | None = None):
-    """Read the MES-published timing aggregate(s) from ERP sim_state.
+    """Read any MES-published timing aggregate(s) from ERP sim_state.
 
     With `cell` given, returns that cell's `{mean_s, n}`; otherwise pools the
-    four cells (sample-weighted mean, summed n). Returns {"mean_s","n"}.
-    The MES writes these keys every 30 s (see database.push_timing_to_erp)."""
+    four cells (sample-weighted mean, summed n). Returns ``None`` when there is
+    no data at all.
+
+    NOTE: as of the scheduled-time statistics rework, the MES no longer
+    measures or publishes wall-clock per-piece durations (the old
+    ``push_timing_to_erp`` was removed). So in normal operation there are no
+    ``timing:*`` keys and this returns None, which makes ``expected_seconds``
+    fall back to the static model — exactly the intended behaviour. The pooling
+    logic is retained so a manually-seeded aggregate would still be honoured."""
     cells = [cell] if cell else [1, 2, 3, 4]
     weighted, total_n = 0.0, 0
     for c in cells:
@@ -199,7 +207,9 @@ def read_timing_stats(piece_type: str, cell: int | None = None):
         if n > 0:
             weighted += float(d.get("mean_s", 0.0)) * n
             total_n += n
-    return {"mean_s": (weighted / total_n if total_n else 0.0), "n": total_n}
+    if total_n == 0:
+        return None
+    return {"mean_s": weighted / total_n, "n": total_n}
 
 
 def expected_seconds(piece_type: str, cell: int | None = None,
@@ -257,3 +267,87 @@ def expected_production_days(piece_type: str, cell: int | None = None,
     if secs <= 0:
         return estimate_production_days(piece_type)
     return max(1, math.ceil(secs / SECONDS_PER_DAY))
+
+
+# ---------------------------------------------------------------------------
+# Pipeline-wait model (TASK 3): a cell as a 3-stage pipeline M1 -> M2 -> M3.
+#
+# A piece does NOT start a stage just because that stage went idle; it also has
+# to have cleared the PREVIOUS stage (the pipeline slot). That is the
+# M2-behind-M1 coupling the brief calls out: a piece bound for M2 sitting
+# behind a piece bound for M1 only starts at M2 when the preceding M1 job frees
+# the slot (e.g. 30 s), even if the two current M2 jobs finished earlier (20 s).
+# ---------------------------------------------------------------------------
+
+_PIPELINE_STAGES = ("M1", "M2", "M3")
+
+
+def _stage_times(piece_type: str):
+    """Per-stage service times (M1, M2, M3) for one final product, taken from
+    the recipe op times: M1 shapes the top, M2 the leg path (the two legs shape
+    in parallel on M1/M2, modelled as one leg path on the M2 stage), M3
+    assembles. Mixed pieces (RWM/SWM) cross two cells, so the single-cell
+    pipeline does not apply — they return their op times for a coarse estimate."""
+    r = RECIPES.get(piece_type)
+    if r is None:
+        return (0.0, 0.0, 0.0)
+    return (float(r["top"][1]), float(r["leg"][1]), float(r["asm"][1]))
+
+
+class CellPipeline:
+    """Three serial stages with per-stage `free_at` timelines. Push pieces in
+    order with `add`; each returns its per-stage start/finish/wait and overall
+    finish (including one transport hop between stages and one exit hop)."""
+
+    def __init__(self, hop_seconds: float = TRANSFER_TIME_S):
+        self.free_at = {s: 0.0 for s in _PIPELINE_STAGES}
+        self.hop = float(hop_seconds)
+
+    def add(self, m1: float, m2: float, m3: float, arrival: float = 0.0):
+        info = {}
+        prev_finish = float(arrival)
+        for stage, dur in (("M1", m1), ("M2", m2), ("M3", m3)):
+            # start = max(stage free, arrival from the previous stage). The
+            # second term is what couples M2 to the M1 job ahead of it.
+            start = max(self.free_at[stage], prev_finish)
+            finish = start + float(dur)
+            self.free_at[stage] = finish
+            info[stage] = {"start": start, "finish": finish,
+                           "wait": start - prev_finish}
+            prev_finish = finish + self.hop      # one hop to the next stage
+        info["finish"] = info["M3"]["finish"] + self.hop   # exit hop to Win/W2
+        return info
+
+
+def schedule_day(cell: int, ordered_pieces, arrival: float = 0.0):
+    """Estimate each piece's finish sim-time when `ordered_pieces` (final
+    product types) run in sequence on `cell`, accounting for pipeline
+    contention + per-hop transport. Returns finish seconds aligned with
+    `ordered_pieces`. (Stage times are cell-agnostic across capable cells, so
+    `cell` is informational — it identifies which cell the sequence runs on.)"""
+    pipe = CellPipeline()
+    finishes = []
+    for pt in ordered_pieces:
+        m1, m2, m3 = _stage_times(pt)
+        finishes.append(pipe.add(m1, m2, m3, arrival)["finish"])
+    return finishes
+
+
+def deadline_finish_seconds(piece_type: str, cell: int | None = None,
+                            **kw) -> float:
+    """PESSIMISTIC single-piece finish estimate for a deadline check:
+    expected_seconds + TIME_TOLERANCE_S, so we never promise a delivery we
+    might miss (the brief's "+/- ~5 s", taken on the safe side)."""
+    return expected_seconds(piece_type, cell, **kw) + TIME_TOLERANCE_S
+
+
+def optimistic_seconds(piece_type: str, cell: int | None = None, **kw) -> float:
+    """OPTIMISTIC single-piece estimate (display only): expected_seconds minus
+    the tolerance, floored at 0."""
+    return max(0.0, expected_seconds(piece_type, cell, **kw) - TIME_TOLERANCE_S)
+
+
+def deadline_finish_days(piece_type: str, cell: int | None = None, **kw) -> int:
+    """Whole sim days for the pessimistic (deadline-safe) finish estimate."""
+    secs = deadline_finish_seconds(piece_type, cell, **kw)
+    return max(1, math.ceil(secs / SECONDS_PER_DAY)) if secs > 0 else 0

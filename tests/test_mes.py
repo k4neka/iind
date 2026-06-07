@@ -133,6 +133,57 @@ class OptimizerTests(unittest.TestCase):
         self.assertEqual(chunks, [])
 
 
+class StatisticsOpsTests(unittest.TestCase):
+    """Dispatch-side op records that feed the statistics recorder (TASK 1):
+    each op's OUTPUT piece is attributed to the machine that ran it, and
+    tool_change is counted against the tool mounted just before the op."""
+
+    def setUp(self):
+        _stubs.use_mes_path()
+        import importlib
+        self.opt = importlib.import_module("optimizer")
+        self.ts = importlib.import_module("tool_state")
+
+    def test_optimizer_ops_carry_output_piece(self):
+        chunks, _ = _quiet(self.opt.optimise_batch,
+                           [{"id": 1, "piece_type": "RWW"}])
+        _rows, _cell, _caps, subparts = chunks[0]
+        legs = [s for s in subparts if not s.get("final")]
+        top = [s for s in subparts if s.get("final")][0]
+        # Leg shaping ops output LegW; the M3 park op (tool 0) has no output.
+        for leg in legs:
+            self.assertEqual(leg["ops"][0]["out"], "LegW")
+            self.assertNotIn("out", leg["ops"][1])
+        # Top shaping outputs RtopW; M3 assembly outputs the FINAL product RWW
+        # (not attributed to the shaping machines).
+        self.assertEqual(top["ops"][0]["out"], "RtopW")
+        self.assertEqual(top["ops"][1]["out"], "RWW")
+
+    def test_apply_ops_emits_records_and_counts_changes(self):
+        t = self.ts.ToolStateTracker()        # in-memory; cell1 M1=1,M2=1,M3=8
+        chunks, _ = _quiet(self.opt.optimise_batch,
+                           [{"id": 1, "piece_type": "RWW"}])
+        _rows, cell, _caps, subparts = chunks[0]
+        records = []
+        for sp in subparts:
+            records.extend(t.apply_ops(cell, sp["ops"]))
+        # One record per real op: 2 leg shaping + 1 top shaping + 1 assembly.
+        self.assertEqual(len(records), 4)
+        self.assertEqual(sorted(r["out"] for r in records),
+                         ["LegW", "LegW", "RWW", "RtopW"])
+        self.assertTrue(all(r["tool"] != 0 and r["time_s"] > 0
+                            for r in records))
+        # M3 assembly uses tool 8, already mounted at startup -> no change.
+        asm = next(r for r in records if r["out"] == "RWW")
+        self.assertEqual(asm["slot"], 3)
+        self.assertFalse(asm["tool_change"])
+        # The optimiser's sticky-tool logic keeps both legs on the same machine
+        # (reusing T3) and shapes the top on the M1 that already holds T1, so a
+        # cold RWW causes exactly ONE real tool change (the first leg, T1->T3).
+        # tool_changes must equal the switches the optimiser actually caused.
+        self.assertEqual(sum(1 for r in records if r["tool_change"]), 1)
+
+
 class MesQueueCapTests(unittest.TestCase):
     def setUp(self):
         self.db = _stubs.install_fake_mes_db()
@@ -152,6 +203,65 @@ class MesQueueCapTests(unittest.TestCase):
                {"items": [{"piece_type": "RWW", "quantity": 50,
                            "order_line_id": 2}]})
         self.assertEqual(len(self.db.queue), self.cfg.MAX_QUEUED)
+
+
+class _FakePLC:
+    """Minimal async PLC stub exposing only the dock reads the unloader uses
+    during load/seed."""
+    def __init__(self, counts):
+        self._counts = dict(counts)
+
+    async def read_all_dock_counts(self):
+        return dict(self._counts)
+
+    async def read_dock_count(self, dock):
+        return self._counts.get(dock, 0)
+
+
+class UnloaderPersistenceTests(unittest.TestCase):
+    """TASK 4: the unloader books survive a mid-day MES restart and a stale
+    owner (dock the PLC shows empty) is cleared on reload."""
+
+    def setUp(self):
+        self.db = _stubs.install_fake_mes_db()
+        import importlib
+        self.un = importlib.import_module("unloader")
+
+    def test_books_survive_restart(self):
+        import asyncio
+        plc = _FakePLC({1: 0, 2: 2, 3: 0, 4: 0, 5: 0})
+        um1 = self.un.UnloaderManager(plc=plc)
+        # A half-built line on dock 2, plus one spare RWW credited to W2.
+        um1._lines = {7: {"client": "C", "order": 99, "piece_type": "RWW",
+                          "ddate": 5, "target": 4, "need": 2, "on_docks": 2,
+                          "docks": {2}}}
+        um1._w2_stock = {"RWW": 1}
+        um1._dock_owner[2] = 7
+        um1._dock_count[2] = 2
+        _quiet(um1._persist)
+        # Restart: a fresh manager loads the same persisted books.
+        um2 = self.un.UnloaderManager(plc=plc)
+        _quiet(lambda: asyncio.run(um2._ensure_loaded()))
+        self.assertIn(7, um2._lines)
+        self.assertEqual(um2._lines[7]["on_docks"], 2)
+        self.assertEqual(um2._lines[7]["docks"], {2})
+        self.assertEqual(um2._w2_stock.get("RWW"), 1)
+        self.assertEqual(um2._dock_owner[2], 7)        # ownership resumed
+        self.assertEqual(um2._dock_count[2], 2)
+
+    def test_empty_dock_clears_stale_owner(self):
+        import asyncio
+        plc = _FakePLC({1: 0, 2: 0, 3: 0, 4: 0, 5: 0})  # dock 2 now empty
+        um1 = self.un.UnloaderManager(plc=plc)
+        um1._lines = {7: {"client": "C", "order": 1, "piece_type": "RWW",
+                          "ddate": 5, "target": 4, "need": 4, "on_docks": 0,
+                          "docks": set()}}
+        um1._dock_owner[2] = 7
+        um1._dock_count[2] = 0
+        _quiet(um1._persist)
+        um2 = self.un.UnloaderManager(plc=plc)
+        _quiet(lambda: asyncio.run(um2._ensure_loaded()))
+        self.assertIsNone(um2._dock_owner[2])          # no pieces -> cleared
 
 
 class MesConfigTests(unittest.TestCase):

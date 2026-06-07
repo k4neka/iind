@@ -23,7 +23,8 @@ import asyncio
 from datetime import datetime, timezone
 
 from config import NUM_CELLS, COMPLEX_PIECES, COMPLEX_RECIPE
-from database import queued_pieces, mark_dispatched, mark_cell_started
+from database import (queued_pieces, mark_dispatched, mark_cell_started,
+                      set_dispatched_ops)
 from optimizer import optimise_batch
 from transformations import ID_TO_PIECE
 from piece_id import next_piece_id
@@ -179,8 +180,17 @@ class Dispatcher:
             # row stores it so completion_loop can map g_Done back to the row.
             wire = next_piece_id()
             row = chunk_rows[0]
+            # Advance the tool tracker and capture per-op statistics records
+            # NOW, at dispatch (TASK 1): apply_ops returns one record per real
+            # op {cell, slot, tool, time_s, out, tool_change}. Persisting them
+            # on the row means the machine work is committed to the stats tables
+            # when the piece completes, even across an MES restart.
+            op_records = []
+            if self.tools:
+                for sp in subparts:
+                    op_records.extend(self.tools.apply_ops(cell, sp["ops"]))
             mark_dispatched(row["id"], cell, subparts[0]["raw"],
-                            wire_piece_id=wire)
+                            wire_piece_id=wire, dispatched_ops=op_records)
             print(f"[disp] {row['piece_type']} (db id {row['id']}, "
                   f"wire {wire}) -> Cell_{cell} as {len(subparts)} subparts "
                   f"(hint was Cell_{target_cell})")
@@ -228,9 +238,8 @@ class Dispatcher:
                                           datetime.now(timezone.utc))
                     except Exception as e:
                         print(f"[disp] mark_cell_started error: {e}")
-                # Carry the mounted-tool state forward for the next batch.
-                if self.tools:
-                    self.tools.apply_ops(cell, sp["ops"])
+                # NOTE: the tool tracker is advanced at dispatch (in tick), not
+                # here, so dispatched_ops can be persisted up front (TASK 1).
             print(f"[disp] {chunk_rows[0]['piece_type']} all subparts sent "
                   f"to Cell_{cell}")
         finally:
@@ -286,11 +295,24 @@ class ComplexOrchestrator:
         # is picked under _router_lock so it follows the actual push order.
         self._top_machines = [2, 1]
         self._top_rr = 0
+        # Round-robin the wood SOURCE cell of the top across both wood cells
+        # (C1, C2) so two assembly cells aren't both fed by one wood cell
+        # (TASK 5). The corridor transfer that carries the top W2->W1 stays
+        # serialised PLC-side (and via _router_lock here), so spreading the
+        # SHAPING source is safe — it does not raise the number of concurrent
+        # corridor transfers. Picked under _router_lock so it follows the
+        # actual push order.
+        self._top_cell_rr = 0
 
     def _next_top_machine(self) -> int:
         m = self._top_machines[self._top_rr % len(self._top_machines)]
         self._top_rr += 1
         return m
+
+    def _next_top_cell(self, cells) -> int:
+        c = cells[self._top_cell_rr % len(cells)]
+        self._top_cell_rr += 1
+        return c
 
     # ---- helpers --------------------------------------------------------
 
@@ -395,8 +417,15 @@ class ComplexOrchestrator:
                   f"will retry next tick")
             self._inflight = max(0, self._inflight - 1)
             return
-        top_cell = top["cells"][0]   # wood cell (shaping only; frees quickly)
+        # Wood cell that shapes the top (shaping only; frees quickly). Chosen
+        # under _router_lock below so the C1/C2 round-robin follows push order.
 
+        # Per-op statistics records collected as routes are pushed, persisted
+        # on the piece's row so they commit to the stats tables on completion
+        # (TASK 1). For a complex piece the histogram is: 2x LegM on the
+        # assembly cell's shaping machines, 1x top (RtopW/StopW) on the wood
+        # cell, and 1x final product (RWM/SWM) on the assembly cell's M3.
+        op_records = []
         try:
             # Reserve raw material in the local W1 model up front.
             for material, qty in self._raw_need(rec).items():
@@ -408,7 +437,7 @@ class ComplexOrchestrator:
                 leg_ops = [
                     {"cell": asm_cell, "machine": m,
                      "tool": leg["tool"], "op_time_s": leg["time_s"],
-                     "piece_arg": 0},
+                     "piece_arg": 0, "out": leg["piece"]},
                     {"cell": asm_cell, "machine": M3,
                      "tool": 0, "op_time_s": 0, "piece_arg": 0},
                 ]
@@ -419,23 +448,24 @@ class ComplexOrchestrator:
                         init_piece=leg["raw_id"], operations=leg_ops,
                         piece_id=next_piece_id(), parent_id=wire)
                 if self.tools:
-                    self.tools.apply_ops(asm_cell, leg_ops)
+                    op_records.extend(self.tools.apply_ops(asm_cell, leg_ops))
 
-            # --- Route for the top: shape, transfer W2->W1, assemble. Machine
-            #     (M2/M1) and the push are decided together under the lock so
-            #     "first top -> M2, second -> M1" stays deterministic and the
-            #     two tops shape in parallel in the wood cell. ---
+            # --- Route for the top: shape, transfer W2->W1, assemble. The wood
+            #     cell (C1/C2), the machine (M2/M1) and the push are decided
+            #     together under the lock so the round-robins stay deterministic
+            #     and follow the actual corridor push order (TASK 5). ---
             async with self._router_lock:
+                top_cell = self._next_top_cell(top["cells"])
                 top_machine = self._next_top_machine()
                 top_ops = [
                     {"cell": top_cell, "machine": top_machine,
                      "tool": top["tool"], "op_time_s": top["time_s"],
-                     "piece_arg": 0},
+                     "piece_arg": 0, "out": top["piece"]},
                     {"cell": 0, "machine": 0, "tool": 0, "op_time_s": 0,
                      "piece_arg": top["id"]},          # transfer: pull shaped top
                     {"cell": asm_cell, "machine": asm["machine"],
                      "tool": asm["tool"], "op_time_s": asm["time_s"],
-                     "piece_arg": 0},
+                     "piece_arg": 0, "out": pt},        # M3 assembles final product
                 ]
                 print(f"[complex] {pt}: route top -> Cell_{top_cell} "
                       f"M{top_machine} shape, transfer, assemble@Cell_{asm_cell}")
@@ -443,8 +473,19 @@ class ComplexOrchestrator:
                     init_piece=top["raw_id"], operations=top_ops,
                     piece_id=wire, parent_id=wire)  # final product keyed by wire
                 if self.tools:
-                    self.tools.apply_ops(top_cell, top_ops)
-                    self.tools.apply_ops(asm_cell, top_ops)
+                    # apply_ops filters by cell, so each call records only the
+                    # ops that ran on that cell (top shaping on top_cell, the
+                    # M3 assembly on asm_cell).
+                    op_records.extend(self.tools.apply_ops(top_cell, top_ops))
+                    op_records.extend(self.tools.apply_ops(asm_cell, top_ops))
+
+            # Persist the per-op records on the piece's row (it was already
+            # mark_dispatched in _tick; the routes — hence the cells — are only
+            # known now) so completion_loop can commit them to the stats tables.
+            try:
+                set_dispatched_ops(pid, op_records)
+            except Exception as e:
+                print(f"[complex] set_dispatched_ops({pid}) failed: {e}")
 
             print(f"[complex] {pt} (db id {pid}, wire {wire}) fully routed "
                   f"to PLC; completion will arrive via g_Done buffer")

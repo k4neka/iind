@@ -19,9 +19,21 @@ def reset():
         "db_erp.sim_state",
         "db_erp.mes_status_log",
         "db_erp.production_costs",
+        "db_erp.stock_reservations",
         "db_mes.pending_pieces",
-        "db_mes.machine_occupancy",
-        "db_mes.consumed_messages"
+        "db_mes.consumed_messages",
+        # Scheduled-time machine statistics (TASK 1) + persisted mounted tools
+        # (TASK 6): emptying machine_tool_state makes the MES re-seed it to the
+        # startup tools on next boot.
+        "db_mes.machine_stats",
+        "db_mes.machine_tool_seconds",
+        "db_mes.machine_piece_counts",
+        "db_mes.machine_tool_state",
+        # Persisted unloader books + per-type unloaded tallies (TASK 4).
+        "db_mes.unloader_lines",
+        "db_mes.unloader_w2_stock",
+        "db_mes.dock_state",
+        "db_mes.unloaded_pieces",
     ]
     
     conn = None

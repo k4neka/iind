@@ -242,13 +242,33 @@ class FakeMESDB(types.ModuleType):
     def mark_message_consumed(self, mid):
         self.consumed.add(mid)
 
+    # ---- unloader books (TASK 4): in-memory mirror of the DB tables ----
+    def unloader_save_books(self, lines, w2_stock, dock_owner, dock_count):
+        import copy
+        self._u_lines = copy.deepcopy(lines)
+        self._u_w2 = dict(w2_stock)
+        self._u_owners = dict(dock_owner)
+        self._u_counts = dict(dock_count)
+
+    def unloader_load_books(self):
+        import copy
+        return (copy.deepcopy(getattr(self, "_u_lines", {})),
+                dict(getattr(self, "_u_w2", {})),
+                dict(getattr(self, "_u_owners", {})))
+
+    def unloader_record_unloaded(self, dock, piece_type, qty):
+        self._u_unloaded = getattr(self, "_u_unloaded", {})
+        key = (dock, piece_type)
+        self._u_unloaded[key] = self._u_unloaded.get(key, 0) + qty
+
 
 def install_fake_mes_db():
     """Fresh in-memory MES DB; drops cached MES modules. Returns it."""
     use_mes_path()
     fake = FakeMESDB()
     sys.modules["database"] = fake
-    for m in ("mqtt_client", "dispatcher", "main", "config"):
+    for m in ("mqtt_client", "dispatcher", "main", "config", "unloader",
+              "statistics"):
         sys.modules.pop(m, None)
     return fake
 

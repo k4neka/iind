@@ -57,17 +57,83 @@ def init_db():
             finished_at    TIMESTAMPTZ,
             created_at     TIMESTAMPTZ DEFAULT NOW()
         );
-        CREATE TABLE IF NOT EXISTS production_timing (
-            id              SERIAL PRIMARY KEY,
-            piece_type      TEXT NOT NULL,
-            cell            INT  NOT NULL,
-            preceding_type  TEXT,
-            actual_seconds  NUMERIC NOT NULL,
-            recorded_at     TIMESTAMPTZ DEFAULT NOW()
-        );
         CREATE TABLE IF NOT EXISTS consumed_messages (
             message_id  TEXT PRIMARY KEY,
             consumed_at TIMESTAMPTZ DEFAULT NOW()
+        );
+
+        -- ===== Machine statistics from SCHEDULED op times (TASK 1) =====
+        -- Per (cell, slot): cumulative operating time, tool-change time/count
+        -- and number of ops performed. Occupation % is derived at read time
+        -- from these and the elapsed sim time (sim_base_day * 60).
+        CREATE TABLE IF NOT EXISTS machine_stats (
+            cell                INT NOT NULL,
+            slot                INT NOT NULL,
+            operating_seconds   NUMERIC NOT NULL DEFAULT 0,
+            tool_change_seconds NUMERIC NOT NULL DEFAULT 0,
+            tool_changes        INT     NOT NULL DEFAULT 0,
+            pieces_operated     INT     NOT NULL DEFAULT 0,
+            updated_at          TIMESTAMPTZ DEFAULT NOW(),
+            PRIMARY KEY (cell, slot)
+        );
+        -- Cumulative operating seconds per tool on each machine (cloud
+        -- dashboard "tool usage", Req 3).
+        CREATE TABLE IF NOT EXISTS machine_tool_seconds (
+            cell    INT NOT NULL,
+            slot    INT NOT NULL,
+            tool    INT NOT NULL,
+            seconds NUMERIC NOT NULL DEFAULT 0,
+            PRIMARY KEY (cell, slot, tool)
+        );
+        -- Histogram of each op's OUTPUT piece, attributed to the machine that
+        -- ran it (RtopW/LegW on shaping machines, the final product on M3).
+        CREATE TABLE IF NOT EXISTS machine_piece_counts (
+            cell       INT  NOT NULL,
+            slot       INT  NOT NULL,
+            piece_type TEXT NOT NULL,
+            count      INT  NOT NULL DEFAULT 0,
+            PRIMARY KEY (cell, slot, piece_type)
+        );
+        -- Currently-mounted tool per machine, so it survives an MES restart
+        -- (TASK 6). Maintained by ToolStateTracker, not record_completion.
+        CREATE TABLE IF NOT EXISTS machine_tool_state (
+            cell       INT NOT NULL,
+            slot       INT NOT NULL,
+            tool       INT NOT NULL,
+            updated_at TIMESTAMPTZ DEFAULT NOW(),
+            PRIMARY KEY (cell, slot)
+        );
+
+        -- ===== Unloader books, persisted so they survive restart (TASK 4) =====
+        -- Per-line whole-order delivery book (mirrors UnloaderManager._lines).
+        CREATE TABLE IF NOT EXISTS unloader_lines (
+            order_line_id BIGINT PRIMARY KEY,
+            client        TEXT,
+            order_id      BIGINT,
+            piece_type    TEXT,
+            ddate         BIGINT,
+            target        INT,
+            need          INT,
+            on_docks      INT,
+            docks         JSONB         -- list of dock ids this line owns
+        );
+        -- Finished-goods available in W2 by type (the unloader's W2 ledger).
+        CREATE TABLE IF NOT EXISTS unloader_w2_stock (
+            piece_type TEXT PRIMARY KEY,
+            qty        INT NOT NULL DEFAULT 0
+        );
+        -- Per-dock ownership + occupancy mirror (dashboard reads occupancy).
+        CREATE TABLE IF NOT EXISTS dock_state (
+            dock          INT PRIMARY KEY,
+            owner_line_id BIGINT,
+            count         INT NOT NULL DEFAULT 0
+        );
+        -- Lifetime count of pieces discharged (delivered) per dock, BY TYPE.
+        CREATE TABLE IF NOT EXISTS unloaded_pieces (
+            dock       INT  NOT NULL,
+            piece_type TEXT NOT NULL,
+            qty        INT  NOT NULL DEFAULT 0,
+            PRIMARY KEY (dock, piece_type)
         );
 
         -- Backward-compatible migrations for older DBs.
@@ -75,6 +141,12 @@ def init_db():
             ADD COLUMN IF NOT EXISTS wire_piece_id INT;
         ALTER TABLE pending_pieces
             ADD COLUMN IF NOT EXISTS cell_started_at TIMESTAMPTZ;
+        -- The ops the MES sent for this piece: list of
+        -- {cell, slot, tool, time_s, out, tool_change}. Written at dispatch so
+        -- a mid-day restart can still attribute the machine work when the
+        -- piece completes; committed into the stats tables on COMPLETED.
+        ALTER TABLE pending_pieces
+            ADD COLUMN IF NOT EXISTS dispatched_ops JSONB;
 
         -- machine_occupancy was removed with CostTracker (v2 Item 1). Drop it
         -- so the schema stays clean; the original definition is preserved in
@@ -88,6 +160,11 @@ def init_db():
         --       duration_s  NUMERIC
         --   );
         DROP TABLE IF EXISTS machine_occupancy;
+
+        -- production_timing held measured wall-clock per-piece durations. The
+        -- MES no longer measures real machine time (statistics now come from
+        -- the SCHEDULED op times, see statistics.py); drop the stale table.
+        DROP TABLE IF EXISTS production_timing;
         """)
         conn.commit()
 
@@ -137,15 +214,70 @@ def queued_pieces():
         return cur.fetchall()
 
 
-def mark_dispatched(piece_pk, cell, init_piece_id, wire_piece_id=None):
+def mark_dispatched(piece_pk, cell, init_piece_id, wire_piece_id=None,
+                    dispatched_ops=None):
+    """Mark a piece IN_PROGRESS. `dispatched_ops` (a list of per-op stat
+    records) is persisted as JSONB so its machine work can be committed to the
+    statistics tables when the piece completes — even across an MES restart."""
+    ops_json = json.dumps(dispatched_ops) if dispatched_ops is not None else None
     with get_conn() as conn:
         cur = conn.cursor()
         cur.execute("""UPDATE pending_pieces
                           SET status='IN_PROGRESS', assigned_cell=%s,
                               init_piece_id=%s, wire_piece_id=%s,
-                              started_at=NOW()
+                              dispatched_ops=%s, started_at=NOW()
                         WHERE id=%s""",
-                    (cell, init_piece_id, wire_piece_id, piece_pk))
+                    (cell, init_piece_id, wire_piece_id, ops_json, piece_pk))
+        conn.commit()
+
+
+def set_dispatched_ops(piece_pk, dispatched_ops):
+    """Attach (or overwrite) the dispatched-ops record for a piece already
+    marked IN_PROGRESS (used by the complex orchestrator, which learns its
+    final routes after mark_dispatched)."""
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("UPDATE pending_pieces SET dispatched_ops=%s WHERE id=%s",
+                    (json.dumps(dispatched_ops), piece_pk))
+        conn.commit()
+
+
+# ---------- persisted mounted-tool state (TASK 6) ----------
+
+def load_tool_state():
+    """Return {(cell, slot): tool} of currently-mounted tools from the DB, or
+    {} when nothing has been stored yet (a fresh DB)."""
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT cell, slot, tool FROM machine_tool_state")
+        return {(int(c), int(s)): int(t) for c, s, t in cur.fetchall()}
+
+
+def save_tool_state(cell, slot, tool):
+    """Write through one machine's currently-mounted tool."""
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            """INSERT INTO machine_tool_state(cell, slot, tool, updated_at)
+               VALUES(%s,%s,%s,NOW())
+               ON CONFLICT (cell, slot) DO UPDATE
+                   SET tool = EXCLUDED.tool, updated_at = NOW()""",
+            (int(cell), int(slot), int(tool)))
+        conn.commit()
+
+
+def save_all_tool_state(mapping):
+    """Bulk write {(cell, slot): tool} (used on PLC reconnect reset, when every
+    machine returns to its startup tool)."""
+    with get_conn() as conn:
+        cur = conn.cursor()
+        for (cell, slot), tool in mapping.items():
+            cur.execute(
+                """INSERT INTO machine_tool_state(cell, slot, tool, updated_at)
+                   VALUES(%s,%s,%s,NOW())
+                   ON CONFLICT (cell, slot) DO UPDATE
+                       SET tool = EXCLUDED.tool, updated_at = NOW()""",
+                (int(cell), int(slot), int(tool)))
         conn.commit()
 
 
@@ -172,6 +304,87 @@ def mark_completed(piece_pk, real_cost):
         conn.commit()
 
 
+# ---------- unloader books persistence (TASK 4) ----------
+
+def unloader_save_books(lines, w2_stock, dock_owner, dock_count):
+    """Rewrite the three small unloader books in one transaction (write-through
+    on every mutation). `lines` is {order_line_id: {client, order, piece_type,
+    ddate, target, need, on_docks, docks:set}}; `w2_stock` is {piece_type: qty};
+    `dock_owner`/`dock_count` are {dock: owner_line_id|None} / {dock: count}."""
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("DELETE FROM unloader_lines")
+        for lid, L in lines.items():
+            cur.execute(
+                """INSERT INTO unloader_lines(order_line_id, client, order_id,
+                       piece_type, ddate, target, need, on_docks, docks)
+                   VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                (int(lid), L.get("client"), L.get("order"),
+                 L.get("piece_type"), L.get("ddate"), L.get("target"),
+                 L.get("need"), L.get("on_docks"),
+                 json.dumps(sorted(L.get("docks", set())))))
+        cur.execute("DELETE FROM unloader_w2_stock")
+        for ptype, qty in w2_stock.items():
+            if qty:
+                cur.execute("INSERT INTO unloader_w2_stock(piece_type, qty) "
+                            "VALUES(%s,%s)", (ptype, int(qty)))
+        cur.execute("DELETE FROM dock_state")
+        for d, owner in dock_owner.items():
+            cur.execute("INSERT INTO dock_state(dock, owner_line_id, count) "
+                        "VALUES(%s,%s,%s)",
+                        (int(d), owner, int(dock_count.get(d, 0))))
+        conn.commit()
+
+
+def unloader_load_books():
+    """Load the persisted unloader books. Returns (lines, w2_stock, owners):
+    lines = {order_line_id: {...}} (docks as a set), w2_stock = {piece_type:
+    qty}, owners = {dock: owner_line_id|None}. Empty when nothing stored yet."""
+    with get_conn() as conn:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute("SELECT * FROM unloader_lines")
+        lines = {}
+        for r in cur.fetchall():
+            docks = r["docks"]
+            if isinstance(docks, str):
+                docks = json.loads(docks)
+            lines[int(r["order_line_id"])] = {
+                "client":     r["client"],
+                "order":      r["order_id"],
+                "piece_type": r["piece_type"],
+                "ddate":      int(r["ddate"]) if r["ddate"] is not None
+                              else 10 ** 9,
+                "target":     int(r["target"] or 0),
+                "need":       int(r["need"] or 0),
+                "on_docks":   int(r["on_docks"] or 0),
+                "docks":      set(int(d) for d in (docks or [])),
+            }
+        cur.execute("SELECT piece_type, qty FROM unloader_w2_stock")
+        w2 = {row["piece_type"]: int(row["qty"]) for row in cur.fetchall()}
+        cur.execute("SELECT dock, owner_line_id FROM dock_state")
+        owners = {int(row["dock"]):
+                  (int(row["owner_line_id"])
+                   if row["owner_line_id"] is not None else None)
+                  for row in cur.fetchall()}
+        return lines, w2, owners
+
+
+def unloader_record_unloaded(dock, piece_type, qty):
+    """Accumulate `qty` pieces of `piece_type` discharged (delivered) from
+    `dock` into the lifetime per-dock per-type tally (Req 4.3)."""
+    if not piece_type or qty <= 0:
+        return
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            """INSERT INTO unloaded_pieces(dock, piece_type, qty)
+               VALUES(%s,%s,%s)
+               ON CONFLICT (dock, piece_type) DO UPDATE
+                   SET qty = unloaded_pieces.qty + EXCLUDED.qty""",
+            (int(dock), piece_type, int(qty)))
+        conn.commit()
+
+
 def piece_by_wire_id(wire_id):
     """Resolve a g_Done ParentID (a wire PieceID from the shared generator)
     back to its pending_pieces row.
@@ -187,88 +400,10 @@ def piece_by_wire_id(wire_id):
         cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
         cur.execute("SELECT id, piece_type, order_id, order_line_id, "
                     "status, finished_at, assigned_cell, started_at, "
-                    "cell_started_at "
+                    "cell_started_at, dispatched_ops "
                     "FROM pending_pieces WHERE wire_piece_id=%s "
                     "ORDER BY id DESC LIMIT 1", (wire_id,))
         return cur.fetchone()
-
-
-# ---------- production timing (replaces machine-occupancy costing) ----------
-
-def add_timing_sample(piece_type, cell, preceding_type, actual_seconds):
-    """Record one measured production time for `piece_type` on `cell`.
-
-    `preceding_type` is the piece type produced just before this one on the
-    same cell (NULL if unknown), so a later analysis can see tool-change
-    savings for back-to-back same-type runs."""
-    with get_conn() as conn:
-        cur = conn.cursor()
-        cur.execute(
-            """INSERT INTO production_timing
-                   (piece_type, cell, preceding_type, actual_seconds)
-               VALUES(%s,%s,%s,%s)""",
-            (piece_type, int(cell), preceding_type, float(actual_seconds)))
-        conn.commit()
-
-
-def get_timing_samples(piece_type, cell, limit=30):
-    """The most recent `limit` `actual_seconds` samples for (piece_type,
-    cell), newest first. Returns a list of dicts."""
-    with get_conn() as conn:
-        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-        cur.execute(
-            """SELECT piece_type, cell, preceding_type, actual_seconds,
-                      recorded_at
-               FROM production_timing
-               WHERE piece_type=%s AND cell=%s
-               ORDER BY recorded_at DESC LIMIT %s""",
-            (piece_type, int(cell), int(limit)))
-        return cur.fetchall()
-
-
-def distinct_timing_keys():
-    """Every (piece_type, cell) pair that has at least one timing sample."""
-    with get_conn() as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT DISTINCT piece_type, cell FROM production_timing")
-        return [(r[0], int(r[1])) for r in cur.fetchall()]
-
-
-def last_completed_on_cell(cell, before):
-    """The previous COMPLETED piece on `cell`, finished before `before`
-    (a TIMESTAMPTZ — pass this piece's `started_at`). Returns the row dict
-    or None when there is no earlier piece."""
-    with get_conn() as conn:
-        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-        cur.execute(
-            """SELECT piece_type FROM pending_pieces
-               WHERE assigned_cell=%s AND status='COMPLETED'
-                 AND finished_at IS NOT NULL AND finished_at < %s
-               ORDER BY finished_at DESC LIMIT 1""",
-            (int(cell), before))
-        return cur.fetchone()
-
-
-def push_timing_to_erp(piece_type, cell, mean_s, n, min_s, max_s):
-    """Publish one timing aggregate into the ERP's sim_state table so the
-    ERP planner can read measured production times at replan() time.
-
-    Cross-schema write: the MES pool's search_path is db_mes, so the target
-    is fully qualified as db_erp.sim_state (same PostgreSQL server/user).
-    Key namespace `timing:{type}:{cell}` is distinct from the clock's
-    `sim_base_day` key. Guarded by the caller; a missing ERP schema/table
-    just means the ERP hasn't booted yet and we retry next cycle."""
-    key = f"timing:{piece_type}:{cell}"
-    value = json.dumps({"mean_s": round(float(mean_s), 2), "n": int(n),
-                        "min_s": round(float(min_s), 2),
-                        "max_s": round(float(max_s), 2)})
-    with get_conn() as conn:
-        cur = conn.cursor()
-        cur.execute(
-            """INSERT INTO db_erp.sim_state(key, value) VALUES(%s,%s)
-               ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value""",
-            (key, value))
-        conn.commit()
 
 
 def is_message_consumed(message_id: str) -> bool:

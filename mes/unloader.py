@@ -32,6 +32,8 @@ A single asyncio.Lock serialises the OPC-UA request slot shared by all docks.
 import asyncio
 
 from config import NUM_DOCKS, DOCK_CAPACITY, PIECE_ID
+from database import (unloader_save_books, unloader_load_books,
+                      unloader_record_unloaded)
 
 
 class UnloaderManager:
@@ -50,8 +52,24 @@ class UnloaderManager:
         # dock -> pieces currently on it (local mirror of g_Unloader_DockCount)
         self._dock_count = {d: 0 for d in range(1, NUM_DOCKS + 1)}
         self._seeded = False
+        # The books (lines / W2 / dock ownership) are loaded from the DB once on
+        # first run so a mid-day MES restart resumes them (TASK 4).
+        self._loaded = False
         # §4.3 statistic: pieces discharged per dock (lifetime).
         self._discharged = {d: 0 for d in range(1, NUM_DOCKS + 1)}
+
+    # ---- persistence (TASK 4) ------------------------------------------
+
+    def _persist(self):
+        """Write-through the three small books. Synchronous (like every other
+        DB call in the codebase); the books are tiny so rewriting them whole on
+        each mutation is cheap and keeps the DB an exact mirror for restart +
+        the dashboard."""
+        try:
+            unloader_save_books(self._lines, self._w2_stock,
+                                self._dock_owner, self._dock_count)
+        except Exception as e:
+            print(f"[unload] persist failed: {e}")
 
     # ---- visibility -----------------------------------------------------
 
@@ -74,6 +92,9 @@ class UnloaderManager:
         self._w2_stock[piece_type] = self._w2_stock.get(piece_type, 0) + qty
         print(f"[unload] W2 +{qty} {piece_type} "
               f"(available {self._w2_stock[piece_type]})")
+        # Persist the W2 ledger so a restart resumes the same finished-goods
+        # credit (TASK 4). Called from completion_loop on the asyncio thread.
+        self._persist()
 
     # ---- delivery-order intake -----------------------------------------
 
@@ -121,6 +142,7 @@ class UnloaderManager:
                 print(f"[unload] line {lid} (client={L['client']} "
                       f"order={L['order']} {ptype}x{L['target']} "
                       f"ddate={L['ddate']}): need {L['need']} on docks")
+            self._persist()
 
     # ---- background loop -----------------------------------------------
 
@@ -136,8 +158,8 @@ class UnloaderManager:
     # ---- placing pieces onto docks (most-urgent line first) ------------
 
     async def _drain_pending(self):
-        if not self._seeded:
-            await self._seed_counts()
+        if not self._loaded:
+            await self._ensure_loaded()
 
         # Lines that still need pieces, most urgent first (ddate, then id).
         async with self._state_lock:
@@ -176,6 +198,7 @@ class UnloaderManager:
                         0, self._w2_stock.get(ptype, 0) - n)
 
             if placed_total > 0:
+                self._persist()
                 print(f"[unload] line {lid} (client={L['client']} "
                       f"order={L['order']}): {L['on_docks']}/{L['target']} on "
                       f"dock(s) {sorted(L['docks'])}, {L['need']} still needed")
@@ -238,6 +261,8 @@ class UnloaderManager:
                 self._dock_count[dock] = await self.plc.read_dock_count(dock)
             if ok:
                 self._discharged[dock] += have
+                # Lifetime per-dock per-type tally (TASK 4 / Req 4.3).
+                unloader_record_unloaded(dock, L["piece_type"], have)
                 if self.publish_status:
                     self.publish_status({
                         "event":         "ORDER_DISPATCHED",
@@ -253,6 +278,7 @@ class UnloaderManager:
                 if self._dock_owner.get(d) == lid:
                     self._dock_owner[d] = None
             self._lines.pop(lid, None)
+            self._persist()
 
     # ---- end of day (backstop) -----------------------------------------
 
@@ -261,8 +287,8 @@ class UnloaderManager:
         the moment they fill; here we flush anything still sitting on docks so
         a partially-built urgent order is still delivered (late) rather than
         held. Each owned dock is discharged and its line cleared."""
-        if not self._seeded:
-            await self._seed_counts()
+        if not self._loaded:
+            await self._ensure_loaded()
         async with self._state_lock:
             lines = list(self._lines.items())
         flushed = False
@@ -284,13 +310,43 @@ class UnloaderManager:
                     self._discharged[dock] += have
                     print(f"[unload] end-of-day: cleared orphan dock {dock} "
                           f"({have} pieces)")
+                    # Orphan docks have no line record, so the piece type is
+                    # unknown -> only the dock count is reconciled, not the
+                    # per-type tally.
+        self._persist()
         if not flushed:
             print("[unload] end-of-day: nothing on docks to dispatch")
 
     # ---- helpers --------------------------------------------------------
 
-    async def _seed_counts(self):
+    async def _ensure_loaded(self):
+        """First-run init (TASK 4): restore the persisted books, then snap dock
+        occupancy to the PLC (ground truth — pieces physically stay on docks
+        across an MES restart). A dock the PLC shows empty cannot still be owned,
+        so a stale owner with no pieces is cleared."""
+        if self._loaded:
+            return
+        try:
+            lines, w2, owners = unloader_load_books()
+            if lines:
+                self._lines = lines
+            if w2:
+                self._w2_stock = w2
+            for d, owner in owners.items():
+                if d in self._dock_owner:
+                    self._dock_owner[d] = owner
+            if lines or w2 or any(owners.values()):
+                print(f"[unload] resumed {len(self._lines)} line(s), "
+                      f"W2 ledger {self._w2_stock}, dock owners "
+                      f"{ {d: o for d, o in self._dock_owner.items() if o} }")
+        except Exception as e:
+            print(f"[unload] load books failed (starting fresh): {e}")
+
         counts = await self.plc.read_all_dock_counts()
         for d in range(1, NUM_DOCKS + 1):
             self._dock_count[d] = counts.get(d, 0)
+            if self._dock_count[d] == 0:
+                self._dock_owner[d] = None      # no pieces -> ownership is stale
+        self._loaded = True
         self._seeded = True
+        self._persist()

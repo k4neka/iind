@@ -40,6 +40,10 @@ TOOL_CHANGE_TIME_S = 30    # changing between any two tools (PDF §2)
 TRANSFER_TIME_S    = 5     # moving a piece one hop in a clear cell
 CELL_HOPS          = 6     # Wout->M1->T1->M2->T2->M3->Win
 QUEUE_FACTOR       = 1.5   # inflate transfer time when the line is busy
+# "+/- ~5 s, not exact": deadline checks use the PESSIMISTIC est + this margin
+# (so we never promise a delivery we might miss); est - this is optimistic
+# (display only). See time_model.deadline_finish_seconds / optimistic_seconds.
+TIME_TOLERANCE_S   = 5
 
 # --- Plant limits ---
 WAREHOUSE_CAPACITY = 32
@@ -69,6 +73,18 @@ SUPPLIERS = {
 
 # --- Final products clients can order ---
 FINAL_PRODUCTS = {"RWW", "SWW", "RWM", "SWM", "RMM", "SMM"}
+
+# --- Sales Prices (Revenue) ---
+# COMPETITIVE STRATEGY: Low prices to make Supplier A a safe 5-10€ profit 
+# and make Supplier B a high-risk/high-reward gamble.
+PRODUCT_PRICES = {
+    "RWW": 35.0,
+    "RWM": 45.0,
+    "RMM": 50.0,
+    "SWW": 40.0,
+    "SWM": 50.0,
+    "SMM": 55.0,
+}
 
 # --- Bill of materials ---
 BOM = {

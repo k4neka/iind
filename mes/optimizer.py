@@ -143,10 +143,12 @@ def _plan_chunk(piece_type: str, count: int, tl: CellTimeline,
         tl.reserve(cell, slot, tr["tool"], start, finish)
 
         ops = [
+            # `out` = this op's OUTPUT piece, so the statistics recorder can
+            # attribute "shaped 1 LegW" to the machine that ran it (TASK 1).
             {"cell": cell, "machine": slot,
-             "tool": tr["tool"], "op_time_s": tr["time"]},
+             "tool": tr["tool"], "op_time_s": tr["time"], "out": asm["leg"]},
             {"cell": cell, "machine": 3,
-             "tool": 0, "op_time_s": 0},
+             "tool": 0, "op_time_s": 0},          # park: no tool, no output
         ]
         subparts.append({
             "raw": PIECE_ID[raw_for(asm["leg"])],
@@ -171,10 +173,12 @@ def _plan_chunk(piece_type: str, count: int, tl: CellTimeline,
         tl.reserve(cell, 3, asm["tool"], start3, finish3)
 
         ops = [
+            # Shaping op outputs the top (e.g. RtopW); the M3 op assembles the
+            # FINAL product (e.g. RWW) — attributed to M3, not the shapers.
             {"cell": cell, "machine": slot,
-             "tool": tr["tool"], "op_time_s": tr["time"]},
+             "tool": tr["tool"], "op_time_s": tr["time"], "out": asm["top"]},
             {"cell": cell, "machine": 3,
-             "tool": asm["tool"], "op_time_s": asm["time"]},
+             "tool": asm["tool"], "op_time_s": asm["time"], "out": piece_type},
         ]
         subparts.append({
             "raw": PIECE_ID[raw_for(asm["top"])],

@@ -16,8 +16,8 @@ from collections import defaultdict
 
 from config import (BOM, SUPPLIERS, MAX_UNLOAD_PER_DAY,
                     WAREHOUSE_CAPACITY, PLANNING_HORIZON_DAYS,
-                    BASELINE_STOCK, FINAL_PRODUCTS)
-from time_model import expected_production_days
+                    BASELINE_STOCK, FINAL_PRODUCTS, PRODUCT_PRICES)
+from time_model import expected_production_days, deadline_finish_days
 from database import (
     get_pending_order_lines, get_production_plan, get_purchase_plan,
     add_production_entry, add_purchase_entry,
@@ -112,52 +112,58 @@ def _project_w1_stock(current_day: int, current_inv: dict):
 # Supplier selection (cost optimisation)
 # ---------------------------------------------------------------------------
 
-def _choose_supplier_cost_benefit(material, net_qty, current_day, prod_day,
-                                  ddate, penalty_per_day, prod_days):
-    """Pick the supplier minimising TOTAL cost = purchase + expected
-    late-delivery penalty. Each supplier's lead shifts the completion day
-    (arrival + machine processing); when that passes `ddate` the penalty is
-    charged against it. This is what lets the planner pay SupplierA's premium
-    only when it actually saves more penalty than it costs.
+def _choose_supplier(material, net_qty, current_day, prod_day, ddate,
+                     penalty_per_day, prod_days, piece_type=None):
+    """Pick the supplier that maximises expected NET PROFIT for this material
+    order: profit = revenue - raw cost - expected late penalty.
 
-    Returns (supplier, info, batch, purchase_cost, exp_penalty, days_late).
-    """
+    Strategy (Req 5): if cheap bulk supplier B still lands in time, its lower
+    cost wins; if B's long lead would push the piece past the deadline, the late
+    penalty is weighed against fast supplier A's higher price and the cheaper
+    TOTAL is chosen. Revenue is the same whichever supplier we use (we make the
+    same pieces), so the decision reduces to the smaller of (cost + penalty);
+    revenue is kept in the figure only so the logged profit is meaningful.
+
+    BUGFIX (TASK 7): the old formula divided net_qty by the TOTAL BOM raw
+    (sum over ALL materials), conflating finished pieces with raw units. The
+    number of pieces this MATERIAL order covers is net_qty / (units of THIS
+    material per piece); profit is reported per piece. `piece_type` is optional
+    — without it the choice still works (it never depends on revenue) and the
+    profit figure is simply omitted."""
+    sale_price = PRODUCT_PRICES.get(piece_type, 0.0) if piece_type else 0.0
+    per_piece_units = 1
+    if piece_type and piece_type in BOM:
+        per_piece_units = max(1, BOM[piece_type].get(material, 1))
+    pieces = (net_qty / per_piece_units) if per_piece_units else float(net_qty)
+
     best = None
+    best_profit = -float("inf")
     for name, table in SUPPLIERS.items():
         info = table[material]
-        batch = math.ceil(net_qty / info["min"]) * info["min"]
-        purchase = batch * info["price"]
+        # Buy in multiples of the supplier minimum batch.
+        batch_qty = math.ceil(net_qty / info["min"]) * info["min"]
+        purchase_cost = batch_qty * info["price"]
+        # Late-penalty risk from this supplier's lead time.
         arrival_day = max(prod_day, current_day + info["lead"])
         completion_day = arrival_day + prod_days
         days_late = max(0, completion_day - ddate)
-        penalty = days_late * penalty_per_day
-        total = purchase + penalty
-        cand = (total, purchase, batch, name, info, penalty, days_late)
-        if best is None or cand[0] < best[0]:
-            best = cand
-    total, purchase, batch, name, info, penalty, days_late = best
-    return name, info, batch, purchase, penalty, days_late
+        penalty_cost = days_late * penalty_per_day
+        # Per-piece-correct: revenue for the pieces this order makes, minus its
+        # raw cost and its share of the late penalty.
+        expected_profit = (sale_price * pieces) - purchase_cost - penalty_cost
+        if expected_profit > best_profit:
+            best_profit = expected_profit
+            best = (name, info, batch_qty, purchase_cost, penalty_cost,
+                    days_late)
 
-
-def _choose_supplier(material, net_qty, current_day, prod_day, ddate,
-                     penalty_per_day, prod_days):
-    """Item 6 supplier pick: a single deadline-feasibility guard in front of
-    the (correct) cost-benefit function. If the cheap bulk SupplierB still
-    completes by the deadline, use it and skip the cost-benefit — this stops
-    paying SupplierA's premium unnecessarily. Otherwise fall back to the
-    cost-benefit comparison (which may pick A, or B late, whichever loses
-    least money).
-
-    Returns (supplier, info, batch, purchase_cost, exp_penalty, days_late).
-    """
-    b = SUPPLIERS["SupplierB"][material]
-    completion_b = current_day + b["lead"] + prod_days
-    if completion_b <= ddate:
-        batch = math.ceil(net_qty / b["min"]) * b["min"]
-        return "SupplierB", b, batch, batch * b["price"], 0.0, 0
-    return _choose_supplier_cost_benefit(
-        material, net_qty, current_day, prod_day, ddate,
-        penalty_per_day, prod_days)
+    name, info, batch_qty, purchase_cost, penalty_cost, days_late = best
+    pp = f", profit ~{best_profit / pieces:.2f}€/piece" \
+        if (pieces > 0 and piece_type) else ""
+    print(f"[plan] supplier {name} for {net_qty} {material}"
+          f"{(' (' + piece_type + ')') if piece_type else ''}: "
+          f"batch {batch_qty} cost {purchase_cost:.2f}€, "
+          f"penalty {penalty_cost:.2f}€ (late {days_late}d){pp}")
+    return best
 
 
 # ---------------------------------------------------------------------------
@@ -179,7 +185,7 @@ def _pending_inbound(material: str, by_day=None) -> int:
 
 
 def _place_tranched(material, net_qty, current_day, horizon_end,
-                    ddate, penalty, prod_days, w1_proj, prefer_fast=False):
+                    ddate, penalty, prod_days, w1_proj, piece_type=None, prefer_fast=False):
     """Order `net_qty` of `material` in W1-sized tranches (v3 Bug 2).
 
     A single oversized purchase (e.g. 36 wood) never fits W1 (cap 32) and the
@@ -197,9 +203,11 @@ def _place_tranched(material, net_qty, current_day, horizon_end,
         info = SUPPLIERS[name][material]
         supplier = name
     else:
+        # _choose_supplier handles piece_type=None (the profit figure is then
+        # just omitted); the supplier choice itself never depends on revenue.
         supplier, info, _b, _c, _p, _l = _choose_supplier(
             material, net_qty, current_day, current_day, ddate, penalty,
-            prod_days)
+            prod_days, piece_type)
     remaining = net_qty
     day = current_day + info["lead"]
     drain = max(1, int(prod_days))
@@ -373,9 +381,13 @@ def replan(current_day: int):
                               "prod_days": 0})
                     meta["ddate"] = min(meta["ddate"], ddate)
                     meta["penalty"] = max(meta["penalty"], penalty)
+                    # Pessimistic (deadline-safe) production days for the
+                    # supplier deadline check: est + TIME_TOLERANCE_S so a slow
+                    # bulk supplier is only chosen when it truly still lands in
+                    # time (TASK 3 + 7).
                     meta["prod_days"] = max(
                         meta["prod_days"],
-                        expected_production_days(piece))
+                        deadline_finish_days(piece))
 
             prod_entries.append((prod_day, piece, line_id, False))
 
@@ -394,6 +406,8 @@ def replan(current_day: int):
     # -----------------------------------------------------------------
     mat_demand: dict[str, int] = defaultdict(int)
     mat_meta: dict[str, dict] = {}
+    material_to_piece: dict[str, str] = {} # Fix: track piece type for financial calc
+
     for (prod_day, material), qty in demand.items():
         mat_demand[material] += qty
         dm = demand_meta.get((prod_day, material), {})
@@ -402,6 +416,9 @@ def replan(current_day: int):
         m["ddate"] = min(m["ddate"], dm.get("ddate", horizon_end))
         m["penalty"] = max(m["penalty"], dm.get("penalty", 0.0))
         m["prod_days"] = max(m["prod_days"], dm.get("prod_days", 1))
+        # Find which piece triggered this material demand
+        for pt, bom in BOM.items():
+            if material in bom: material_to_piece[material] = pt
 
     w1_proj = _project_w1_stock(current_day, raw_stock)
     for material, gross_qty in sorted(mat_demand.items()):
@@ -416,7 +433,7 @@ def replan(current_day: int):
             continue
         _place_tranched(material, net_qty, current_day, horizon_end,
                         meta["ddate"], meta["penalty"], meta["prod_days"],
-                        w1_proj)
+                        w1_proj, piece_type=material_to_piece.get(material, "RWW"))
 
     # -----------------------------------------------------------------
     # Commit production entries (from_stock rows deliver without producing).

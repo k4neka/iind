@@ -73,6 +73,49 @@ class TimeModelTests(unittest.TestCase):
         self.assertGreaterEqual(self.tm.expected_production_days("RMM"), 1)
 
 
+class PipelineModelTests(unittest.TestCase):
+    """TASK 3: the cell pipeline models the M2-behind-M1 coupling."""
+
+    def setUp(self):
+        self.db = _stubs.install_fake_erp_db()
+        import importlib
+        self.tm = importlib.import_module("time_model")
+
+    def test_m2_behind_m1_coupling(self):
+        pipe = self.tm.CellPipeline(hop_seconds=0)
+        # Two earlier pieces left the M2 stage free at t=20.
+        pipe.free_at["M2"] = 20.0
+        # A new piece whose M1 job takes 30s, then a short M2 job.
+        info = pipe.add(m1=30, m2=5, m3=0, arrival=0.0)
+        self.assertEqual(info["M1"]["finish"], 30.0)
+        # It starts at M2 only when M1 frees the pipeline slot (30s), NOT when
+        # the M2 stage went idle (20s) -- the larger 30s gate, not 20s.
+        self.assertEqual(info["M2"]["start"], 30.0)
+        self.assertEqual(info["M2"]["wait"], 0.0)   # M1 path is the binding gate
+
+    def test_m2_bound_waits_for_stage(self):
+        # Opposite case: when M2 is busy past the M1 finish, the piece waits at
+        # M2 and the wait is measured from its M1 finish.
+        pipe = self.tm.CellPipeline(hop_seconds=0)
+        pipe.free_at["M2"] = 50.0
+        info = pipe.add(m1=30, m2=5, m3=0, arrival=0.0)
+        self.assertEqual(info["M2"]["start"], 50.0)
+        self.assertEqual(info["M2"]["wait"], 20.0)  # 50 - 30 (its M1 finish)
+
+    def test_schedule_day_contention(self):
+        finishes = self.tm.schedule_day(1, ["RWW", "RWW"])
+        self.assertEqual(len(finishes), 2)
+        self.assertGreater(finishes[1], finishes[0])   # 2nd waits behind 1st
+
+    def test_deadline_pessimistic_and_optimistic(self):
+        base = self.tm.expected_seconds("RWW")
+        self.assertEqual(self.tm.deadline_finish_seconds("RWW"),
+                         base + self.tm.TIME_TOLERANCE_S)
+        self.assertEqual(self.tm.optimistic_seconds("RWW"),
+                         max(0.0, base - self.tm.TIME_TOLERANCE_S))
+        self.assertGreaterEqual(self.tm.deadline_finish_days("RWW"), 1)
+
+
 class PlannerUnitTests(unittest.TestCase):
     def setUp(self):
         self.db = _stubs.install_fake_erp_db()

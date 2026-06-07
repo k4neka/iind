@@ -5,13 +5,14 @@ loader ack/flush, timing push, transfer worker, complex orchestrator, and the
 g_Done completion consumer.
 """
 import asyncio
-from datetime import datetime, timezone
 
 from config import DISPATCH_INTERVAL, POLL_WAREHOUSE_INTERVAL
-from database import init_db
+from database import (init_db, load_tool_state, save_tool_state,
+                      save_all_tool_state)
 from opcua_client import PLCClient
 from mqtt_client import MESMqtt
 from tool_state import ToolStateTracker
+from statistics import StatisticsRecorder
 from dispatcher import Dispatcher, ComplexOrchestrator
 from unloader import UnloaderManager
 
@@ -21,7 +22,16 @@ async def main_async():
 
     # One shared tool-state tracker: the optimiser seeds its tool-change
     # model from it; both production paths update it; reset on PLC reconnect.
-    tools = ToolStateTracker()
+    # It loads the currently-mounted tool per machine from the DB on startup
+    # (falling back to the known startup tools) and writes through on every
+    # change, so mounted tools survive an MES restart (TASK 6).
+    tools = ToolStateTracker(load_fn=load_tool_state,
+                             save_fn=save_tool_state,
+                             save_all_fn=save_all_tool_state)
+
+    # Records each completed piece's scheduled machine work into the stats
+    # tables (TASK 1).
+    stats = StatisticsRecorder()
 
     plc = PLCClient(on_reconnect=tools.reset)
     if not await plc.connect():
@@ -114,25 +124,6 @@ async def main_async():
                 print(f"[mes] loader_flush_loop error: {e}")
             await asyncio.sleep(1.0)
 
-    async def timing_push_loop():
-        # Every 30 s, publish measured production-time aggregates into the
-        # ERP sim_state table so the ERP planner can use real durations.
-        from database import (distinct_timing_keys, get_timing_samples,
-                              push_timing_to_erp)
-        while True:
-            try:
-                for ptype, cell in distinct_timing_keys():
-                    vals = [float(s["actual_seconds"])
-                            for s in get_timing_samples(ptype, cell, limit=30)]
-                    if not vals:
-                        continue
-                    n = len(vals)
-                    push_timing_to_erp(ptype, cell, sum(vals) / n, n,
-                                       min(vals), max(vals))
-            except Exception as e:
-                print(f"[timing] push error: {e}")
-            await asyncio.sleep(30)
-
     async def completion_loop():
         # Form A: consume the PLC completion buffer (g_Done_*). The PLC writes
         # one event per finished product into an empty slot; we map its wire
@@ -144,8 +135,7 @@ async def main_async():
         # We report the FINAL PRODUCT type (e.g. 'RWM'), resolved by wire id,
         # NOT the InitPiece (the shaped top 'RtopW', which would log a wrong
         # '+1 RtopW' with an empty BOM at the ERP).
-        from database import (mark_completed, piece_by_wire_id,
-                              add_timing_sample, last_completed_on_cell)
+        from database import mark_completed, piece_by_wire_id
         from transformations import ID_TO_PIECE
         while True:
             try:
@@ -174,16 +164,11 @@ async def main_async():
                         ptype = row["piece_type"]            # e.g. 'RWM'
                         order_id = row.get("order_id")
                         order_line_id = row.get("order_line_id")
-                        cell = row.get("assigned_cell")
-                        # Prefer the cell-entry time (excludes queue wait,
-                        # v3 Bug 7); fall back to the enqueue time.
-                        started = (row.get("cell_started_at")
-                                   or row.get("started_at"))
                     else:
                         # Fallback: unknown wire -> best-effort InitPiece map.
                         db_id = None
                         ptype = ID_TO_PIECE.get(ev["type"], ev["type"])
-                        order_id = order_line_id = cell = started = None
+                        order_id = order_line_id = None
 
                     # CostTracker is gone: per-piece cost is no longer tracked.
                     real_cost = 0.0
@@ -192,6 +177,15 @@ async def main_async():
                             mark_completed(db_id, real_cost)
                         except Exception as e:
                             print(f"[done] mark_completed({db_id}) failed: {e}")
+                        # Commit this piece's scheduled machine work into the
+                        # statistics tables now that it actually COMPLETED
+                        # (TASK 1). The ops were persisted at dispatch, so this
+                        # holds even across an MES restart between the two.
+                        try:
+                            stats.record_completion(row.get("dispatched_ops"))
+                        except Exception as e:
+                            print(f"[done] record_completion({db_id}) failed: "
+                                  f"{e}")
                     mqtt_bridge.publish_status({
                         "order_id":      order_id,
                         "order_line_id": order_line_id,
@@ -207,20 +201,6 @@ async def main_async():
                     # order. Credit the unloader's W2 ledger (pending delivery
                     # demand drains against this).
                     unloader.credit_w2(ptype)
-
-                    # Production-timing sample (Item 2): now - started_at, with
-                    # the piece that ran on this cell just before it.
-                    if cell and started:
-                        try:
-                            prev = last_completed_on_cell(cell, before=started)
-                            preceding = prev["piece_type"] if prev else None
-                            actual = ((datetime.now(timezone.utc) - started)
-                                      .total_seconds())
-                            add_timing_sample(ptype, cell, preceding, actual)
-                            print(f"[timing] {ptype} on Cell_{cell}: "
-                                  f"{actual:.1f}s (prev={preceding})")
-                        except Exception as e:
-                            print(f"[timing] sample failed: {e}")
 
                     # Release complex serialisation + held assembly cell, and
                     # drive the stale re-injection recv_cmd low (band-aid). A
@@ -244,7 +224,6 @@ async def main_async():
             dispatcher_loop(),
             loader_ack_loop(),
             loader_flush_loop(),
-            timing_push_loop(),
             orchestrator.run_loop(),
             completion_loop(),
             unloader.run_loop(),
