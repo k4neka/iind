@@ -72,18 +72,38 @@ ensure_pip() {
 
 bootstrap_venv() {
     # $1 = venv dir, $2 = requirements file ("" for none), $3 = label
+    # Fast path: when the venv already exists and requirements.txt is unchanged
+    # (matched against a stored hash), skip pip entirely -- pip install over the
+    # /mnt/c filesystem is the slow part of startup, so this makes repeat
+    # launches near-instant.
     local dir="$1" req="$2" label="$3"
     local py="$dir/bin/python"
+    local created=0
     if [ ! -x "$py" ]; then
         echo "[run_all] [$label] creating venv at $dir"
         python3 -m venv "$dir" 2>/dev/null || python3 -m venv --without-pip "$dir"
+        created=1
     fi
     ensure_pip "$py" || { echo "[run_all] [$label] could not provision pip"; return 1; }
-    "$py" -m pip install --quiet --upgrade pip >/dev/null 2>&1 || true
+    # Only upgrade pip when the venv was just created (avoids a network call
+    # on every launch).
+    if [ "$created" -eq 1 ]; then
+        "$py" -m pip install --quiet --upgrade pip >/dev/null 2>&1 || true
+    fi
     if [ -n "$req" ] && [ -f "$req" ]; then
-        echo "[run_all] [$label] installing $req"
-        "$py" -m pip install --quiet -r "$req" || {
-            echo "[run_all] [$label] WARN: requirements install failed"; }
+        local stamp="$dir/.req_hash"
+        local newhash; newhash="$(md5sum "$req" 2>/dev/null | awk '{print $1}')"
+        if [ "$created" -eq 1 ] || [ ! -f "$stamp" ] \
+                || [ "$(cat "$stamp" 2>/dev/null)" != "$newhash" ]; then
+            echo "[run_all] [$label] installing $req"
+            if "$py" -m pip install --quiet -r "$req"; then
+                echo "$newhash" >"$stamp"
+            else
+                echo "[run_all] [$label] WARN: requirements install failed"
+            fi
+        else
+            echo "[run_all] [$label] deps up to date (skipping pip)"
+        fi
     fi
 }
 

@@ -17,6 +17,11 @@ TOPIC_MATERIAL_LOAD_METAL = "factory/erp/material_load/metal"
 
 TOPIC_PRODUCTION_ORDERS = "factory/erp/production_orders"
 TOPIC_MES_STATUS        = "factory/mes/status"
+# Retained readiness flag: the MES publishes {"ready": true} here once it is
+# connected to the PLC (Codesys) and MQTT, so the ERP only sends it material /
+# production / delivery orders when the MES can actually act on them. A
+# last-will of {"ready": false} flips it back if the MES drops.
+TOPIC_MES_ONLINE        = "factory/mes/online"
 
 # Delivery orders from the ERP: pieces to place on the unloading docks
 # during the day, then discharge at end-of-day. The ERP also sends an

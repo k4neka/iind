@@ -18,6 +18,14 @@ class SimClock:
         elapsed = time.time() - self._start_real
         return self._base_day + int(elapsed // SECONDS_PER_DAY)
 
+    def reset_epoch(self):
+        """Re-anchor 'now' to the current real time (keeping the persisted base
+        day). The day count then starts counting forward from this instant —
+        used to align sim day 0 with the moment the MES comes online, so day-0
+        material/orders are dispatched to a live MES (and arrivals line up)."""
+        self._start_real = time.time()
+        self._last_day = self.current_day()
+
     def seconds_into_day(self) -> float:
         elapsed = time.time() - self._start_real
         return elapsed % SECONDS_PER_DAY

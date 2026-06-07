@@ -273,6 +273,49 @@ class ERPInventorySyncTests(unittest.TestCase):
         self.assertEqual(self.db.inventory.get("RWW"), None)
 
 
+class MesReadyGateTests(unittest.TestCase):
+    """The ERP only dispatches to the MES once it reports it is online."""
+
+    def setUp(self):
+        self.db = _stubs.install_fake_erp_db()
+        import importlib
+        self.mc = importlib.import_module("mqtt_client")
+        self.pl = importlib.import_module("planner")
+
+    def test_handle_mes_online_sets_and_clears(self):
+        b = self.mc.MQTTBridge()
+        self.assertFalse(b.is_mes_ready())
+        _quiet(b._handle_mes_online, json.dumps({"ready": True}).encode())
+        self.assertTrue(b.is_mes_ready())
+        _quiet(b._handle_mes_online, json.dumps({"ready": False}).encode())
+        self.assertFalse(b.is_mes_ready())
+        _quiet(b._handle_mes_online, b"")            # wiped/empty -> ignored
+        self.assertFalse(b.is_mes_ready())
+
+    def test_dispatch_holds_until_mes_ready(self):
+        self.db.add_order_line("RWW", 2, ddate=10, penalty=10)
+        _quiet(self.pl.replan, 0)
+
+        class OfflineBridge(_stubs.CollectBridge):
+            def is_mes_ready(self):
+                return False
+
+        offline = OfflineBridge()
+        _quiet(self.pl.dispatch_today, 0, offline)
+        self.assertEqual(offline.loads, [])          # nothing sent while offline
+        self.assertEqual(offline.production, [])
+        self.assertEqual(offline.delivery, [])
+
+        class OnlineBridge(_stubs.CollectBridge):
+            def is_mes_ready(self):
+                return True
+
+        online = OnlineBridge()
+        _quiet(self.pl.dispatch_today, 0, online)
+        # Day-0 baseline (12 Wood + 8 Metal, lead 0) arrives and is now sent.
+        self.assertTrue(online.loads)
+
+
 class SimClockTests(unittest.TestCase):
     def setUp(self):
         self.db = _stubs.install_fake_erp_db()

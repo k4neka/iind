@@ -218,6 +218,22 @@ async def main_async():
                 print(f"[done] completion_loop error: {e}")
             await asyncio.sleep(0.5)
 
+    async def online_loop():
+        # Announce MES readiness so the ERP only sends material/production/
+        # delivery once the MES can act on them. The PLC connected successfully
+        # above (we'd have exited otherwise), so once MQTT is up the MES is
+        # "connected to Codesys + MQTT". Re-publish periodically (retained) so a
+        # late- or re-started ERP still learns the state.
+        announced = False
+        while True:
+            if mqtt_bridge.connected:
+                mqtt_bridge.publish_online(True)
+                if not announced:
+                    print("[mes] online -> ready for ERP orders "
+                          "(PLC + MQTT connected)")
+                    announced = True
+            await asyncio.sleep(10)
+
     try:
         await asyncio.gather(
             warehouse_loop(),
@@ -227,6 +243,7 @@ async def main_async():
             orchestrator.run_loop(),
             completion_loop(),
             unloader.run_loop(),
+            online_loop(),
         )
     finally:
         await plc.disconnect()

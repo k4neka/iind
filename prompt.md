@@ -559,3 +559,600 @@ and Ctrl-C stops everything.
 After each task: `python -m py_compile` the changed files, run
 `tests/run_all.py` if present, and do a short end-to-end run with `./run_all.sh`
 to confirm no regression in the completion/unload flow.
+
+artur@PcAorusArtur:/mnt/c/Users/artur/OneDrive - Universidade do Porto/Faculdade/Mestrado/2s/iind/iind_proj$ ./run_all.sh --gui
+[run_all] Provisioning virtual environments...
+[run_all] [erp] installing /mnt/c/Users/artur/OneDrive - Universidade do Porto/Faculdade/Mestrado/2s/iind/iind_proj/erp/requirements.txt
+[run_all] [mes] installing /mnt/c/Users/artur/OneDrive - Universidade do Porto/Faculdade/Mestrado/2s/iind/iind_proj/mes/requirements.txt
+[run_all] [dashboard] installing /mnt/c/Users/artur/OneDrive - Universidade do Porto/Faculdade/Mestrado/2s/iind/iind_proj/dashboards/requirements.txt
+[run_all] Launching ERP...
+[run_all] Waiting for ERP TCP port 6666...
+[mqtt] connected rc=0
+[mqtt] wiped retained messages on material_load topics
+[plan] baseline Wood: deficit 12, ordering (fast)
+[plan] purchase: 12 Wood from SupplierA (order day 0, arrives day 0, cost 120.00€, remaining 0)
+[plan] baseline Metal: deficit 8, ordering (fast)
+[plan] purchase: 8 Metal from SupplierA (order day 0, arrives day 0, cost 120.00€, remaining 0)
+[dispatch] day 0: sending material_load 12 Wood to MES (W1 inventory updated)
+[mqtt-out] factory/erp/material_load/wood -> {"command": "load_material", "type": "Wood", "quantity": 12, "message_id": "cfc58364-8dce-4229-9505-e925664c3fb8"}
+[dispatch] day 0: sending material_load 8 Metal to MES (W1 inventory updated)
+[mqtt-out] factory/erp/material_load/metal -> {"command": "load_material", "type": "Metal", "quantity": 8, "message_id": "5b0e0ac8-dba2-41ef-acd5-b39b44931103"}
+[tcp] ERP listening on 0.0.0.0:6666
+[run_all] ERP is accepting client orders on :6666
+[run_all] Launching MES...
+[run_all] Launching dashboard service...
+========================================================================
+Dashboard: open dashboards/dashboard.html, connect MQTT-WS to localhost:9001
+Dashboard: open dashboards/dashboard.html, connect MQTT-WS to 172.25.142.229:9001
+(open dashboard.html?host=<HOST>&port=9001 to preselect a host; use whichever your Windows browser can reach)
+========================================================================
+[dashboard-svc] reading DB + publishing 'factory/mes/dashboard' to broker localhost:1883 (TCP) every 2s
+/mnt/c/Users/artur/OneDrive - Universidade do Porto/Faculdade/Mestrado/2s/iind/iind_proj/dashboards/dashboard_service.py:320: DeprecationWarning: Callback API version 1 is deprecated, update to latest version
+  client = mqtt.Client(client_id="DashboardService")
+
+===================== DASHBOARD CONNECTION =====================
+Dashboard: open dashboards/dashboard.html, connect MQTT-WS to localhost:9001
+Dashboard: open dashboards/dashboard.html, connect MQTT-WS to 172.25.142.229:9001
+(append ?host=<HOST>&port=9001 to the HTML URL)
+[opcua] connecting to opc.tcp://172.25.128.1:4840...
+[opcua] connected to opc.tcp://172.25.128.1:4840
+[mqtt] connected rc=0
+[mqtt] ignoring stale retained on factory/erp/material_load/wood (boot window 0.0s)
+[mqtt] ignoring stale retained on factory/erp/material_load/metal (boot window 0.0s)
+[wh] PLC W1=0/32  W2(MES)=0/32
+NOTE: no MQTT WebSocket listener on :9001 -> the browser cannot connect.
+      Start the broker with: mosquitto -c dashboards/mosquitto_ws.conf
+===============================================================
+
+[run_all] Launching Client Order GUI...
+[run_all] All processes started. Ctrl-C to stop everything.
+
+=== [sim] New day: 1 ===
+[mqtt-out] factory/erp/end_of_day -> {"sim_day": 0}
+[mqtt] end_of_day (sim_day 0): discharging docks
+[unload] end-of-day: nothing on docks to dispatch
+
+=== [sim] New day: 2 ===
+[mqtt-out] factory/erp/end_of_day -> {"sim_day": 1}
+[mqtt] end_of_day (sim_day 1): discharging docks
+[unload] end-of-day: nothing on docks to dispatch
+[tcp] ('127.0.0.1', 59436) -> accepted=1 rejected=0
+[plan] supplier SupplierB for 18 Wood (SMM): batch 24 cost 48.00€, penalty 0.00€ (late 0d), profit ~52.33€/piece
+[plan] purchase: 12 Wood from SupplierB (order day 2, arrives day 4, cost 24.00€, remaining 6)
+[plan] purchase: 12 Wood from SupplierB (order day 4, arrives day 6, cost 24.00€, remaining -6)
+[plan] replan done: 10/10 pieces scheduled (0 from finished stock), 1 material demands evaluated, stock_at_start=wood:12 metal:8
+[mqtt-out] factory/erp/production_orders -> {"sim_day": 2, "items": [{"production_plan_id": 1, "order_line_id": 1, "piece_type": "RWW", "quantity": 1}, {"production_plan_id": 2, "order_line_id": 1, "piece_type": "RWW", "quantity": 1}, {"production_plan_id": 3, "order_line_id": 1, "piece_type": "RWW", "quantity": 1}, {"production_plan_id": 4, "order_line_id": 1, "piece_type": "RWW", "quantity": 1}]}
+[mqtt-out] factory/erp/delivery_orders -> {"sim_day": 2, "items": [{"production_plan_id": 1, "order_line_id": 1, "piece_type": "RWW", "quantity": 1, "line_quantity": 10, "ddate": 12, "client_order_id": 1001, "client_name": "Fools'n Horses"}, {"production_plan_id": 2, "order_line_id": 1, "piece_type": "RWW", "quantity": 1, "line_quantity": 10, "ddate": 12, "client_order_id": 1001, "client_name": "Fools'n Horses"}, {"production_plan_id": 3, "order_line_id": 1, "piece_type": "RWW", "quantity": 1, "line_quantity": 10, "ddate": 12, "client_order_id": 1001, "client_name": "Fools'n Horses"}, {"production_plan_id": 4, "order_line_id": 1, "piece_type": "RWW", "quantity": 1, "line_quantity": 10, "ddate": 12, "client_order_id": 1001, "client_name": "Fools'n Horses"}]}
+[disp] tick #216: 1 queued, w1=wood:0/metal:0, free={1: True, 2: True, 3: True, 4: True}
+[disp] W1 empty - waiting for material
+[mqtt] queued 4 pieces from production_orders
+[mqtt] delivery_orders: 4 item(s) for sim_day 2
+[unload] line 1 (client=Fools'n Horses order=1001 RWWx10 ddate=12): need 10 on docks
+[unload] line 1 (client=Fools'n Horses order=1001 RWWx10 ddate=12): need 10 on docks
+[unload] line 1 (client=Fools'n Horses order=1001 RWWx10 ddate=12): need 10 on docks
+[unload] line 1 (client=Fools'n Horses order=1001 RWWx10 ddate=12): need 10 on docks
+[dispatch] day 2: dispatched 4 pieces to MES (0 from stock), 6 held for material
+[disp] tick #236: 4 queued, w1=wood:0/metal:0, free={1: True, 2: True, 3: True, 4: True}
+[disp] W1 empty - waiting for material
+[disp] tick #256: 4 queued, w1=wood:0/metal:0, free={1: True, 2: True, 3: True, 4: True}
+[disp] W1 empty - waiting for material
+[tcp] ('127.0.0.1', 35842) -> accepted=1 rejected=0
+[plan] skip purchase: Wood demand=3 covered by 24 already inbound (by day 6)
+[plan] replan done: 3/3 pieces scheduled (0 from finished stock), 1 material demands evaluated, stock_at_start=wood:0 metal:8
+[dispatch] day 2: nothing dispatchable yet (9 pending, waiting on material)
+
+=== [sim] New day: 3 ===
+[mqtt-out] factory/erp/end_of_day -> {"sim_day": 2}
+[mqtt] end_of_day (sim_day 2): discharging docks
+[unload] end-of-day: nothing on docks to dispatch
+[plan] replan done: 0/0 pieces scheduled (0 from finished stock), 0 material demands evaluated, stock_at_start=wood:0 metal:8
+[disp] tick #276: 4 queued, w1=wood:0/metal:0, free={1: True, 2: True, 3: True, 4: True}
+[disp] W1 empty - waiting for material
+[dispatch] day 3: nothing dispatchable yet (9 pending, waiting on material)
+[tcp] ('127.0.0.1', 35834) -> accepted=1 rejected=0
+[plan] supplier SupplierB for 7 Metal (SMM): batch 8 cost 32.00€, penalty 0.00€ (late 0d), profit ~41.29€/piece
+[plan] purchase: 8 Metal from SupplierB (order day 3, arrives day 7, cost 32.00€, remaining -1)
+[plan] replan done: 5/5 pieces scheduled (0 from finished stock), 1 material demands evaluated, stock_at_start=wood:0 metal:8
+[disp] tick #296: 4 queued, w1=wood:0/metal:0, free={1: True, 2: True, 3: True, 4: True}
+[disp] W1 empty - waiting for material
+[mqtt-out] factory/erp/production_orders -> {"sim_day": 3, "items": [{"production_plan_id": 14, "order_line_id": 3, "piece_type": "RMM", "quantity": 1}, {"production_plan_id": 15, "order_line_id": 3, "piece_type": "RMM", "quantity": 1}]}
+[mqtt-out] factory/erp/delivery_orders -> {"sim_day": 3, "items": [{"production_plan_id": 14, "order_line_id": 3, "piece_type": "RMM", "quantity": 1, "line_quantity": 5, "ddate": 15, "client_order_id": 1001, "client_name": "Fools'n Horses"}, {"production_plan_id": 15, "order_line_id": 3, "piece_type": "RMM", "quantity": 1, "line_quantity": 5, "ddate": 15, "client_order_id": 1001, "client_name": "Fools'n Horses"}]}
+[mqtt] queued 2 pieces from production_orders
+[mqtt] delivery_orders: 2 item(s) for sim_day 3
+[unload] line 3 (client=Fools'n Horses order=1001 RMMx5 ddate=15): need 5 on docks
+[unload] line 3 (client=Fools'n Horses order=1001 RMMx5 ddate=15): need 5 on docks
+[dispatch] day 3: dispatched 2 pieces to MES (0 from stock), 12 held for material
+[disp] tick #316: 6 queued, w1=wood:0/metal:0, free={1: True, 2: True, 3: True, 4: True}
+[disp] W1 empty - waiting for material
+[disp] tick #336: 6 queued, w1=wood:0/metal:0, free={1: True, 2: True, 3: True, 4: True}
+[disp] W1 empty - waiting for material
+[disp] tick #356: 6 queued, w1=wood:0/metal:0, free={1: True, 2: True, 3: True, 4: True}
+[disp] W1 empty - waiting for material
+
+=== [sim] New day: 4 ===
+[mqtt-out] factory/erp/end_of_day -> {"sim_day": 3}
+[mqtt] end_of_day (sim_day 3): discharging docks
+[unload] end-of-day: nothing on docks to dispatch
+[plan] replan done: 0/0 pieces scheduled (0 from finished stock), 0 material demands evaluated, stock_at_start=wood:0 metal:2
+[dispatch] day 4: sending material_load 12 Wood to MES (W1 inventory updated)
+[mqtt-out] factory/erp/material_load/wood -> {"command": "load_material", "type": "Wood", "quantity": 12, "message_id": "903e83ce-309e-4002-92e2-24e9fef22fbf"}
+[mqtt] material_load +wood=12 +metal=0 (pending buffer: wood=12 metal=0)
+[mqtt] flush_loader dispatching wood=12 metal=0
+[opcua] batched-load: batch #1 wood=5 metal=0 (remaining wood=7, metal=0)
+[opcua] trigger_loader_batch wood=5 metal=0
+[w1] PLC sync -> wood:5 metal:0
+[wh] PLC W1=5/32  W2(MES)=0/32
+[w1] -1 Wood (now wood:4 metal:0)
+[w1] -1 Wood (now wood:3 metal:0)
+[w1] -1 Wood (now wood:2 metal:0)
+[disp] RWW (db id 1, wire 1) -> Cell_1 as 3 subparts (hint was Cell_1)
+[opcua] OpTime VariantType detected: Int64
+[w1] PLC sync -> wood:4 metal:0
+[wh] PLC W1=4/32  W2(MES)=0/32
+[w1] -1 Wood (now wood:3 metal:0)
+[w1] -1 Wood (now wood:2 metal:0)
+[w1] -1 Wood (now wood:1 metal:0)
+[disp] RWW (db id 2, wire 3) -> Cell_2 as 3 subparts (hint was Cell_1)
+[opcua] batched-load: batch #2 wood=5 metal=0 (remaining wood=2, metal=0)
+[opcua] trigger_loader_batch wood=5 metal=0
+[w1] PLC sync -> wood:8 metal:0
+[wh] PLC W1=8/32  W2(MES)=0/32
+[w1] PLC sync -> wood:6 metal:0
+[wh] PLC W1=6/32  W2(MES)=0/32
+[opcua] batched-load: batch #3 wood=2 metal=0 (remaining wood=0, metal=0)
+[opcua] trigger_loader_batch wood=2 metal=0
+[mqtt-out] factory/erp/production_orders -> {"sim_day": 4, "items": [{"production_plan_id": 11, "order_line_id": 2, "piece_type": "RWM", "quantity": 1}, {"production_plan_id": 5, "order_line_id": 1, "piece_type": "RWW", "quantity": 1}, {"production_plan_id": 6, "order_line_id": 1, "piece_type": "RWW", "quantity": 1}, {"production_plan_id": 7, "order_line_id": 1, "piece_type": "RWW", "quantity": 1}]}
+[mqtt-out] factory/erp/delivery_orders -> {"sim_day": 4, "items": [{"production_plan_id": 11, "order_line_id": 2, "piece_type": "RWM", "quantity": 1, "line_quantity": 3, "ddate": 6, "client_order_id": 1001, "client_name": "Fools'n Horses"}, {"production_plan_id": 5, "order_line_id": 1, "piece_type": "RWW", "quantity": 1, "line_quantity": 10, "ddate": 12, "client_order_id": 1001, "client_name": "Fools'n Horses"}, {"production_plan_id": 6, "order_line_id": 1, "piece_type": "RWW", "quantity": 1, "line_quantity": 10, "ddate": 12, "client_order_id": 1001, "client_name": "Fools'n Horses"}, {"production_plan_id": 7, "order_line_id": 1, "piece_type": "RWW", "quantity": 1, "line_quantity": 10, "ddate": 12, "client_order_id": 1001, "client_name": "Fools'n Horses"}]}
+[mqtt] queued 4 pieces from production_orders
+[mqtt] delivery_orders: 4 item(s) for sim_day 4
+[unload] line 2 (client=Fools'n Horses order=1001 RWMx3 ddate=6): need 3 on docks
+[unload] line 1 (client=Fools'n Horses order=1001 RWWx10 ddate=12): need 10 on docks
+[unload] line 1 (client=Fools'n Horses order=1001 RWWx10 ddate=12): need 10 on docks
+[unload] line 1 (client=Fools'n Horses order=1001 RWWx10 ddate=12): need 10 on docks
+[dispatch] day 4: dispatched 4 pieces to MES (0 from stock), 8 held for material
+[w1] PLC sync -> wood:7 metal:0
+[wh] PLC W1=7/32  W2(MES)=0/32
+[opcua] batched-load: complete (total wood=12 metal=0)
+[w1] +wood=12 +metal=0 (now wood:19 metal:0)
+[w1] PLC sync -> wood:6 metal:0
+[wh] PLC W1=6/32  W2(MES)=0/32
+[disp] tick #376: 8 queued, w1=wood:6/metal:0, free={1: False, 2: False, 3: True, 4: True}
+[disp] chunk of 1 (RMM) waiting - need wood:0 metal:3 (have wood:6 metal:0)
+[disp] chunk of 1 (RMM) waiting - need wood:0 metal:3 (have wood:6 metal:0)
+[disp] chunk of 1 (RWW) waiting - no capable cell free (capable=[1, 2])
+[disp] chunk of 1 (RWW) waiting - no capable cell free (capable=[1, 2])
+[disp] chunk of 1 (RWW) waiting - no capable cell free (capable=[1, 2])
+[disp] chunk of 1 (RWW) waiting - no capable cell free (capable=[1, 2])
+[disp] chunk of 1 (RWW) waiting - no capable cell free (capable=[1, 2])
+[disp] RWW all subparts sent to Cell_1
+[w1] -1 Wood (now wood:5 metal:0)
+[w1] -1 Wood (now wood:4 metal:0)
+[w1] -1 Wood (now wood:3 metal:0)
+[disp] RWW (db id 3, wire 7) -> Cell_1 as 3 subparts (hint was Cell_1)
+[disp] RWW all subparts sent to Cell_2
+[w1] PLC sync -> wood:5 metal:0
+[wh] PLC W1=5/32  W2(MES)=0/32
+[w1] -1 Wood (now wood:4 metal:0)
+[w1] -1 Wood (now wood:3 metal:0)
+[w1] -1 Wood (now wood:2 metal:0)
+[disp] RWW (db id 4, wire 9) -> Cell_2 as 3 subparts (hint was Cell_2)
+[w1] PLC sync -> wood:4 metal:0
+[wh] PLC W1=4/32  W2(MES)=0/32
+[disp] tick #396: 6 queued, w1=wood:4/metal:0, free={1: False, 2: False, 3: True, 4: True}
+[disp] chunk of 1 (RMM) waiting - need wood:0 metal:3 (have wood:4 metal:0)
+[disp] chunk of 1 (RMM) waiting - need wood:0 metal:3 (have wood:4 metal:0)
+[disp] chunk of 1 (RWW) waiting - no capable cell free (capable=[1, 2])
+[disp] chunk of 1 (RWW) waiting - no capable cell free (capable=[1, 2])
+[disp] chunk of 1 (RWW) waiting - no capable cell free (capable=[1, 2])
+[db] stale connection (attempt 1/3)
+[disp] tick #416: 6 queued, w1=wood:4/metal:0, free={1: False, 2: False, 3: True, 4: True}
+[disp] chunk of 1 (RMM) waiting - need wood:0 metal:3 (have wood:4 metal:0)
+[disp] chunk of 1 (RMM) waiting - need wood:0 metal:3 (have wood:4 metal:0)
+[disp] chunk of 1 (RWW) waiting - no capable cell free (capable=[1, 2])
+[disp] chunk of 1 (RWW) waiting - no capable cell free (capable=[1, 2])
+[disp] chunk of 1 (RWW) waiting - no capable cell free (capable=[1, 2])
+[disp] tick #436: 6 queued, w1=wood:4/metal:0, free={1: False, 2: False, 3: True, 4: True}
+[disp] chunk of 1 (RMM) waiting - need wood:0 metal:3 (have wood:4 metal:0)
+[disp] chunk of 1 (RMM) waiting - need wood:0 metal:3 (have wood:4 metal:0)
+[disp] chunk of 1 (RWW) waiting - no capable cell free (capable=[1, 2])
+[disp] chunk of 1 (RWW) waiting - no capable cell free (capable=[1, 2])
+[disp] chunk of 1 (RWW) waiting - no capable cell free (capable=[1, 2])
+[w1] PLC sync -> wood:3 metal:0
+[wh] PLC W1=3/32  W2(MES)=0/32
+
+=== [sim] New day: 5 ===
+[mqtt-out] factory/erp/end_of_day -> {"sim_day": 4}
+[mqtt] end_of_day (sim_day 4): discharging docks
+[unload] end-of-day: nothing on docks to dispatch
+[w1] PLC sync -> wood:2 metal:0
+[wh] PLC W1=2/32  W2(MES)=0/32
+[disp] tick #456: 6 queued, w1=wood:2/metal:0, free={1: False, 2: False, 3: True, 4: True}
+[disp] chunk of 1 (RMM) waiting - need wood:0 metal:3 (have wood:2 metal:0)
+[disp] chunk of 1 (RMM) waiting - need wood:0 metal:3 (have wood:2 metal:0)
+[disp] chunk of 1 (RWW) waiting - need wood:3 metal:0 (have wood:2 metal:0)
+[disp] chunk of 1 (RWW) waiting - need wood:3 metal:0 (have wood:2 metal:0)
+[disp] chunk of 1 (RWW) waiting - need wood:3 metal:0 (have wood:2 metal:0)
+[disp] RWW all subparts sent to Cell_2
+[plan] replan done: 0/0 pieces scheduled (0 from finished stock), 0 material demands evaluated, stock_at_start=wood:2 metal:0
+[dispatch] day 5: nothing dispatchable yet (8 pending, waiting on material)
+[mqtt-out] factory/mes/status -> {"order_id": null, "order_line_id": 1, "piece_db_id": 2, "piece_type": "RWW", "status": "COMPLETED", "real_cost": 0.0}
+[done] wire=3 (RWW) COMPLETED
+[unload] W2 +1 RWW (available 1)
+[erp] inventory sync: +1 RWW (finished)
+[wh] PLC W1=2/32  W2(MES)=1/32
+[opcua] dock 1: filled 1x piece 9 (now 1/6)
+[unload] placed 1x RWW on dock 1 for line 1 (dock 1/6)
+[mqtt-out] factory/mes/status -> {"event": "DOCK_LOADED", "dock": 1, "order_line_id": 1, "piece_type": "RWW", "quantity": 1}
+[unload] line 1 (client=Fools'n Horses order=1001): 1/10 on dock(s) [1], 9 still needed
+[wh] PLC W1=2/32  W2(MES)=0/32
+[disp] tick #476: 6 queued, w1=wood:2/metal:0, free={1: False, 2: True, 3: True, 4: True}
+[disp] chunk of 1 (RMM) waiting - need wood:0 metal:3 (have wood:2 metal:0)
+[disp] chunk of 1 (RMM) waiting - need wood:0 metal:3 (have wood:2 metal:0)
+[disp] chunk of 1 (RWW) waiting - need wood:3 metal:0 (have wood:2 metal:0)
+[disp] chunk of 1 (RWW) waiting - need wood:3 metal:0 (have wood:2 metal:0)
+[disp] chunk of 1 (RWW) waiting - need wood:3 metal:0 (have wood:2 metal:0)
+[disp] tick #496: 6 queued, w1=wood:2/metal:0, free={1: False, 2: True, 3: True, 4: True}
+[disp] chunk of 1 (RMM) waiting - need wood:0 metal:3 (have wood:2 metal:0)
+[disp] chunk of 1 (RMM) waiting - need wood:0 metal:3 (have wood:2 metal:0)
+[disp] chunk of 1 (RWW) waiting - need wood:3 metal:0 (have wood:2 metal:0)
+[disp] chunk of 1 (RWW) waiting - need wood:3 metal:0 (have wood:2 metal:0)
+[disp] chunk of 1 (RWW) waiting - need wood:3 metal:0 (have wood:2 metal:0)
+[disp] tick #516: 6 queued, w1=wood:2/metal:0, free={1: False, 2: True, 3: True, 4: True}
+[disp] chunk of 1 (RMM) waiting - need wood:0 metal:3 (have wood:2 metal:0)
+[disp] chunk of 1 (RMM) waiting - need wood:0 metal:3 (have wood:2 metal:0)
+[disp] chunk of 1 (RWW) waiting - need wood:3 metal:0 (have wood:2 metal:0)
+[disp] chunk of 1 (RWW) waiting - need wood:3 metal:0 (have wood:2 metal:0)
+[disp] chunk of 1 (RWW) waiting - need wood:3 metal:0 (have wood:2 metal:0)
+[mqtt-out] factory/mes/status -> {"order_id": null, "order_line_id": 1, "piece_db_id": 4, "piece_type": "RWW", "status": "COMPLETED", "real_cost": 0.0}
+[done] wire=9 (RWW) COMPLETED
+[unload] W2 +1 RWW (available 1)
+[erp] inventory sync: +1 RWW (finished)
+[wh] PLC W1=2/32  W2(MES)=1/32
+[opcua] dock 1: filled 1x piece 9 (now 2/6)
+[unload] placed 1x RWW on dock 1 for line 1 (dock 2/6)
+[mqtt-out] factory/mes/status -> {"event": "DOCK_LOADED", "dock": 1, "order_line_id": 1, "piece_type": "RWW", "quantity": 1}
+[unload] line 1 (client=Fools'n Horses order=1001): 2/10 on dock(s) [1], 8 still needed
+[wh] PLC W1=2/32  W2(MES)=0/32
+[disp] tick #536: 6 queued, w1=wood:2/metal:0, free={1: False, 2: True, 3: True, 4: True}
+[disp] chunk of 1 (RMM) waiting - need wood:0 metal:3 (have wood:2 metal:0)
+[disp] chunk of 1 (RMM) waiting - need wood:0 metal:3 (have wood:2 metal:0)
+[disp] chunk of 1 (RWW) waiting - need wood:3 metal:0 (have wood:2 metal:0)
+[disp] chunk of 1 (RWW) waiting - need wood:3 metal:0 (have wood:2 metal:0)
+[disp] chunk of 1 (RWW) waiting - need wood:3 metal:0 (have wood:2 metal:0)
+
+=== [sim] New day: 6 ===
+[mqtt-out] factory/erp/end_of_day -> {"sim_day": 5}
+[mqtt] end_of_day (sim_day 5): discharging docks
+[unload] DISPATCH line 1 -> client=Fools'n Horses order=1001 RWWx10 from dock(s) [1] (end-of-day flush (partial))
+[opcua] dock 1: discharged 2 (now 0/6)
+[mqtt-out] factory/mes/status -> {"event": "ORDER_DISPATCHED", "dock": 1, "order_line_id": 1, "client": "Fools'n Horses", "order": 1001, "piece_type": "RWW", "quantity": 2}
+[plan] replan done: 0/0 pieces scheduled (0 from finished stock), 0 material demands evaluated, stock_at_start=wood:2 metal:0
+[dispatch] day 6: sending material_load 12 Wood to MES (W1 inventory updated)
+[mqtt-out] factory/erp/material_load/wood -> {"command": "load_material", "type": "Wood", "quantity": 12, "message_id": "a902a361-97b4-4f5b-94bb-5a543eb62562"}
+[mqtt] material_load +wood=12 +metal=0 (pending buffer: wood=12 metal=0)
+[mqtt] flush_loader dispatching wood=12 metal=0
+[opcua] batched-load: batch #1 wood=5 metal=0 (remaining wood=7, metal=0)
+[opcua] trigger_loader_batch wood=5 metal=0
+[w1] PLC sync -> wood:7 metal:0
+[wh] PLC W1=7/32  W2(MES)=0/32
+[w1] -1 Wood (now wood:6 metal:0)
+[w1] -1 Wood (now wood:5 metal:0)
+[w1] -1 Wood (now wood:4 metal:0)
+[disp] RWW (db id 8, wire 13) -> Cell_2 as 3 subparts (hint was Cell_1)
+[w1] PLC sync -> wood:6 metal:0
+[wh] PLC W1=6/32  W2(MES)=0/32
+[opcua] batched-load: batch #2 wood=5 metal=0 (remaining wood=2, metal=0)
+[opcua] trigger_loader_batch wood=5 metal=0
+[mqtt-out] factory/erp/production_orders -> {"sim_day": 6, "items": [{"production_plan_id": 8, "order_line_id": 1, "piece_type": "RWW", "quantity": 1}, {"production_plan_id": 9, "order_line_id": 1, "piece_type": "RWW", "quantity": 1}, {"production_plan_id": 10, "order_line_id": 1, "piece_type": "RWW", "quantity": 1}]}
+[mqtt-out] factory/erp/delivery_orders -> {"sim_day": 6, "items": [{"production_plan_id": 8, "order_line_id": 1, "piece_type": "RWW", "quantity": 1, "line_quantity": 10, "ddate": 12, "client_order_id": 1001, "client_name": "Fools'n Horses"}, {"production_plan_id": 9, "order_line_id": 1, "piece_type": "RWW", "quantity": 1, "line_quantity": 10, "ddate": 12, "client_order_id": 1001, "client_name": "Fools'n Horses"}, {"production_plan_id": 10, "order_line_id": 1, "piece_type": "RWW", "quantity": 1, "line_quantity": 10, "ddate": 12, "client_order_id": 1001, "client_name": "Fools'n Horses"}]}
+[w1] PLC sync -> wood:10 metal:0
+[wh] PLC W1=10/32  W2(MES)=0/32
+[mqtt] queued 3 pieces from production_orders
+[mqtt] delivery_orders: 3 item(s) for sim_day 6
+[unload] line 1 (client=Fools'n Horses order=1001 RWWx10 ddate=12): need 10 on docks
+[unload] line 1 (client=Fools'n Horses order=1001 RWWx10 ddate=12): need 10 on docks
+[unload] line 1 (client=Fools'n Horses order=1001 RWWx10 ddate=12): need 10 on docks
+[dispatch] day 6: dispatched 3 pieces to MES (0 from stock), 5 held for material
+[opcua] batched-load: batch #3 wood=2 metal=0 (remaining wood=0, metal=0)
+[opcua] trigger_loader_batch wood=2 metal=0
+[w1] PLC sync -> wood:12 metal:0
+[wh] PLC W1=12/32  W2(MES)=0/32
+[opcua] batched-load: complete (total wood=12 metal=0)
+[w1] +wood=12 +metal=0 (now wood:24 metal:0)
+[w1] PLC sync -> wood:11 metal:0
+[wh] PLC W1=11/32  W2(MES)=0/32
+[disp] tick #556: 8 queued, w1=wood:11/metal:0, free={1: False, 2: False, 3: True, 4: True}
+[disp] chunk of 1 (RMM) waiting - need wood:0 metal:3 (have wood:11 metal:0)
+[disp] chunk of 1 (RMM) waiting - need wood:0 metal:3 (have wood:11 metal:0)
+[disp] chunk of 1 (RWW) waiting - no capable cell free (capable=[1, 2])
+[disp] chunk of 1 (RWW) waiting - no capable cell free (capable=[1, 2])
+[disp] chunk of 1 (RWW) waiting - no capable cell free (capable=[1, 2])
+[disp] chunk of 1 (RWW) waiting - no capable cell free (capable=[1, 2])
+[disp] chunk of 1 (RWW) waiting - no capable cell free (capable=[1, 2])
+[disp] RWW all subparts sent to Cell_2
+[w1] -1 Wood (now wood:10 metal:0)
+[w1] -1 Wood (now wood:9 metal:0)
+[w1] -1 Wood (now wood:8 metal:0)
+[disp] RWW (db id 9, wire 16) -> Cell_2 as 3 subparts (hint was Cell_1)
+[w1] PLC sync -> wood:10 metal:0
+[wh] PLC W1=10/32  W2(MES)=0/32
+[disp] tick #576: 7 queued, w1=wood:10/metal:0, free={1: False, 2: False, 3: True, 4: True}
+[disp] chunk of 1 (RMM) waiting - need wood:0 metal:3 (have wood:10 metal:0)
+[disp] chunk of 1 (RMM) waiting - need wood:0 metal:3 (have wood:10 metal:0)
+[disp] chunk of 1 (RWW) waiting - no capable cell free (capable=[1, 2])
+[disp] chunk of 1 (RWW) waiting - no capable cell free (capable=[1, 2])
+[disp] chunk of 1 (RWW) waiting - no capable cell free (capable=[1, 2])
+[disp] chunk of 1 (RWW) waiting - no capable cell free (capable=[1, 2])
+[disp] tick #596: 7 queued, w1=wood:10/metal:0, free={1: False, 2: False, 3: True, 4: True}
+[disp] chunk of 1 (RMM) waiting - need wood:0 metal:3 (have wood:10 metal:0)
+[disp] chunk of 1 (RMM) waiting - need wood:0 metal:3 (have wood:10 metal:0)
+[disp] chunk of 1 (RWW) waiting - no capable cell free (capable=[1, 2])
+[disp] chunk of 1 (RWW) waiting - no capable cell free (capable=[1, 2])
+[disp] chunk of 1 (RWW) waiting - no capable cell free (capable=[1, 2])
+[disp] chunk of 1 (RWW) waiting - no capable cell free (capable=[1, 2])
+[w1] PLC sync -> wood:9 metal:0
+[wh] PLC W1=9/32  W2(MES)=0/32
+[w1] PLC sync -> wood:8 metal:0
+[wh] PLC W1=8/32  W2(MES)=0/32
+[disp] RWW all subparts sent to Cell_2
+[w1] -1 Wood (now wood:7 metal:0)
+[w1] -1 Wood (now wood:6 metal:0)
+[w1] -1 Wood (now wood:5 metal:0)
+[disp] RWW (db id 10, wire 19) -> Cell_2 as 3 subparts (hint was Cell_2)
+[w1] PLC sync -> wood:7 metal:0
+[wh] PLC W1=7/32  W2(MES)=0/32
+[disp] tick #616: 6 queued, w1=wood:7/metal:0, free={1: False, 2: False, 3: True, 4: True}
+[disp] chunk of 1 (RMM) waiting - need wood:0 metal:3 (have wood:7 metal:0)
+[disp] chunk of 1 (RMM) waiting - need wood:0 metal:3 (have wood:7 metal:0)
+[disp] chunk of 1 (RWW) waiting - no capable cell free (capable=[1, 2])
+[disp] chunk of 1 (RWW) waiting - no capable cell free (capable=[1, 2])
+[disp] chunk of 1 (RWW) waiting - no capable cell free (capable=[1, 2])
+[opcua] handshake Cell_1: never free
+[disp] chunk aborted at subpart 2
+[mqtt-out] factory/mes/status -> {"order_id": null, "order_line_id": 1, "piece_db_id": 8, "piece_type": "RWW", "status": "COMPLETED", "real_cost": 0.0}
+[done] wire=13 (RWW) COMPLETED
+[unload] W2 +1 RWW (available 1)
+[erp] inventory sync: +1 RWW (finished)
+[wh] PLC W1=7/32  W2(MES)=1/32
+[opcua] dock 1: filled 1x piece 9 (now 1/6)
+[unload] placed 1x RWW on dock 1 for line 1 (dock 1/6)
+[mqtt-out] factory/mes/status -> {"event": "DOCK_LOADED", "dock": 1, "order_line_id": 1, "piece_type": "RWW", "quantity": 1}
+[unload] line 1 (client=Fools'n Horses order=1001): 1/10 on dock(s) [1], 9 still needed
+[wh] PLC W1=7/32  W2(MES)=0/32
+
+=== [sim] New day: 7 ===
+[mqtt-out] factory/erp/end_of_day -> {"sim_day": 6}
+[mqtt] end_of_day (sim_day 6): discharging docks
+[unload] DISPATCH line 1 -> client=Fools'n Horses order=1001 RWWx10 from dock(s) [1] (end-of-day flush (partial))
+[plan] baseline Wood: deficit 7, ordering (fast)
+[opcua] dock 1: discharged 1 (now 0/6)
+[plan] purchase: 8 Wood from SupplierA (order day 7, arrives day 7, cost 80.00€, remaining -1)
+[mqtt-out] factory/mes/status -> {"event": "ORDER_DISPATCHED", "dock": 1, "order_line_id": 1, "client": "Fools'n Horses", "order": 1001, "piece_type": "RWW", "quantity": 1}
+[plan] replan done: 0/0 pieces scheduled (0 from finished stock), 0 material demands evaluated, stock_at_start=wood:5 metal:0
+[dispatch] day 7: sending material_load 8 Metal to MES (W1 inventory updated)
+[mqtt-out] factory/erp/material_load/metal -> {"command": "load_material", "type": "Metal", "quantity": 8, "message_id": "cdb699d7-c86f-4b95-badf-0fbd78abb19a"}
+[dispatch] day 7: sending material_load 8 Wood to MES (W1 inventory updated)
+[mqtt-out] factory/erp/material_load/wood -> {"command": "load_material", "type": "Wood", "quantity": 8, "message_id": "e0cd575b-f93f-480d-8308-8e92562bd71b"}
+[disp] tick #636: 6 queued, w1=wood:7/metal:0, free={1: False, 2: False, 3: True, 4: True}
+[disp] chunk of 1 (RMM) waiting - need wood:0 metal:3 (have wood:7 metal:0)
+[disp] chunk of 1 (RMM) waiting - need wood:0 metal:3 (have wood:7 metal:0)
+[disp] chunk of 1 (RWW) waiting - no capable cell free (capable=[1, 2])
+[disp] chunk of 1 (RWW) waiting - no capable cell free (capable=[1, 2])
+[disp] chunk of 1 (RWW) waiting - no capable cell free (capable=[1, 2])
+[mqtt] material_load +wood=0 +metal=8 (pending buffer: wood=0 metal=8)
+[mqtt] flush_loader dispatching wood=0 metal=8
+[opcua] batched-load: batch #1 wood=0 metal=5 (remaining wood=0, metal=3)
+[opcua] trigger_loader_batch wood=0 metal=5
+[mqtt] material_load +wood=8 +metal=0 (pending buffer: wood=8 metal=0)
+[w1] PLC sync -> wood:7 metal:5
+[wh] PLC W1=12/32  W2(MES)=0/32
+[opcua] batched-load: batch #2 wood=0 metal=3 (remaining wood=0, metal=0)
+[opcua] trigger_loader_batch wood=0 metal=3
+[mqtt-out] factory/erp/production_orders -> {"sim_day": 7, "items": [{"production_plan_id": 12, "order_line_id": 2, "piece_type": "RWM", "quantity": 1}, {"production_plan_id": 13, "order_line_id": 2, "piece_type": "RWM", "quantity": 1}, {"production_plan_id": 16, "order_line_id": 3, "piece_type": "RMM", "quantity": 1}]}
+[mqtt-out] factory/erp/delivery_orders -> {"sim_day": 7, "items": [{"production_plan_id": 12, "order_line_id": 2, "piece_type": "RWM", "quantity": 1, "line_quantity": 3, "ddate": 6, "client_order_id": 1001, "client_name": "Fools'n Horses"}, {"production_plan_id": 13, "order_line_id": 2, "piece_type": "RWM", "quantity": 1, "line_quantity": 3, "ddate": 6, "client_order_id": 1001, "client_name": "Fools'n Horses"}, {"production_plan_id": 16, "order_line_id": 3, "piece_type": "RMM", "quantity": 1, "line_quantity": 5, "ddate": 15, "client_order_id": 1001, "client_name": "Fools'n Horses"}]}
+[w1] -1 Metal (now wood:7 metal:4)
+[w1] -1 Metal (now wood:7 metal:3)
+[w1] -1 Metal (now wood:7 metal:2)
+[disp] RMM (db id 5, wire 21) -> Cell_3 as 3 subparts (hint was Cell_3)
+[mqtt] queued 3 pieces from production_orders
+[mqtt] delivery_orders: 3 item(s) for sim_day 7
+[unload] line 2 (client=Fools'n Horses order=1001 RWMx3 ddate=6): need 3 on docks
+[unload] line 2 (client=Fools'n Horses order=1001 RWMx3 ddate=6): need 3 on docks
+[unload] line 3 (client=Fools'n Horses order=1001 RMMx5 ddate=15): need 5 on docks
+[dispatch] day 7: dispatched 3 pieces to MES (0 from stock), 2 held for material
+[complex] start RWM (db id 7, wire 23) -> routing to PLC Router
+[w1] -1 Wood (now wood:6 metal:2)
+[w1] -2 Metal (now wood:6 metal:0)
+[complex] RWM: route leg 1 -> Cell_4 M2 park@M3
+[w1] PLC sync -> wood:7 metal:8
+[wh] PLC W1=15/32  W2(MES)=0/32
+[complex] RWM: route leg 2 -> Cell_4 M1 park@M3
+[opcua] batched-load: complete (total wood=0 metal=8)
+[w1] +wood=0 +metal=8 (now wood:7 metal:16)
+[complex] start RWM (db id 14, wire 26) -> routing to PLC Router
+[w1] PLC sync -> wood:7 metal:6
+[wh] PLC W1=13/32  W2(MES)=0/32
+[complex] RWM: route top -> Cell_1 M2 shape, transfer, assemble@Cell_4
+[mqtt] flush_loader dispatching wood=8 metal=0
+[opcua] batched-load: batch #1 wood=5 metal=0 (remaining wood=3, metal=0)
+[opcua] trigger_loader_batch wood=5 metal=0
+[w1] PLC sync -> wood:12 metal:4
+[wh] PLC W1=16/32  W2(MES)=0/32
+[opcua] batched-load: batch #2 wood=3 metal=0 (remaining wood=0, metal=0)
+[opcua] trigger_loader_batch wood=3 metal=0
+[w1] PLC sync -> wood:15 metal:3
+[wh] PLC W1=18/32  W2(MES)=0/32
+[opcua] batched-load: complete (total wood=8 metal=0)
+[w1] +wood=8 +metal=0 (now wood:23 metal:3)
+[disp] RMM all subparts sent to Cell_3
+[w1] -1 Wood (now wood:22 metal:3)
+[w1] -2 Metal (now wood:22 metal:1)
+[complex] RWM: route leg 1 -> Cell_3 M2 park@M3
+[w1] PLC sync -> wood:15 metal:3
+[disp] tick #656: 6 queued, w1=wood:15/metal:3, free={1: False, 2: False, 3: False, 4: False}
+[disp] chunk of 1 (RMM) waiting - no capable cell free (capable=[3, 4])
+[disp] chunk of 1 (RMM) waiting - no capable cell free (capable=[3, 4])
+[disp] chunk of 1 (RWW) waiting - no capable cell free (capable=[1, 2])
+[disp] chunk of 1 (RWW) waiting - no capable cell free (capable=[1, 2])
+[disp] chunk of 1 (RWW) waiting - no capable cell free (capable=[1, 2])
+[w1] PLC sync -> wood:14 metal:3
+[wh] PLC W1=17/32  W2(MES)=0/32
+[w1] PLC sync -> wood:13 metal:3
+[wh] PLC W1=16/32  W2(MES)=0/32
+[disp] RWW all subparts sent to Cell_2
+[w1] -1 Wood (now wood:12 metal:3)
+[w1] -1 Wood (now wood:11 metal:3)
+[w1] -1 Wood (now wood:10 metal:3)
+[disp] RWW (db id 11, wire 29) -> Cell_2 as 3 subparts (hint was Cell_1)
+[w1] PLC sync -> wood:13 metal:3
+[w1] PLC sync -> wood:12 metal:3
+[wh] PLC W1=15/32  W2(MES)=0/32
+[disp] tick #676: 5 queued, w1=wood:12/metal:3, free={1: False, 2: False, 3: False, 4: False}
+[disp] chunk of 1 (RMM) waiting - no capable cell free (capable=[3, 4])
+[disp] chunk of 1 (RMM) waiting - no capable cell free (capable=[3, 4])
+[disp] chunk of 1 (RWW) waiting - no capable cell free (capable=[1, 2])
+[disp] chunk of 1 (RWW) waiting - no capable cell free (capable=[1, 2])
+[mqtt-out] factory/mes/status -> {"order_id": null, "order_line_id": 1, "piece_db_id": 9, "piece_type": "RWW", "status": "COMPLETED", "real_cost": 0.0}
+[done] wire=16 (RWW) COMPLETED
+[unload] W2 +1 RWW (available 1)
+[erp] inventory sync: +1 RWW (finished)
+[wh] PLC W1=15/32  W2(MES)=1/32
+[opcua] WARN: Router did not consume the route within timeout; it may have been dropped
+[complex] RWM (db id 7, wire 23) fully routed to PLC; completion will arrive via g_Done buffer
+[complex] RWM: route leg 2 -> Cell_3 M1 park@M3
+[w1] PLC sync -> wood:12 metal:2
+[wh] PLC W1=14/32  W2(MES)=1/32
+[disp] tick #696: 5 queued, w1=wood:12/metal:2, free={1: False, 2: False, 3: False, 4: False}
+[disp] chunk of 1 (RMM) waiting - need wood:0 metal:3 (have wood:12 metal:2)
+[disp] chunk of 1 (RMM) waiting - need wood:0 metal:3 (have wood:12 metal:2)
+[disp] chunk of 1 (RWW) waiting - no capable cell free (capable=[1, 2])
+[disp] chunk of 1 (RWW) waiting - no capable cell free (capable=[1, 2])
+[w1] PLC sync -> wood:11 metal:2
+[wh] PLC W1=13/32  W2(MES)=1/32
+[disp] tick #716: 5 queued, w1=wood:11/metal:2, free={1: False, 2: False, 3: False, 4: False}
+[disp] chunk of 1 (RMM) waiting - need wood:0 metal:3 (have wood:11 metal:2)
+[disp] chunk of 1 (RMM) waiting - need wood:0 metal:3 (have wood:11 metal:2)
+[disp] chunk of 1 (RWW) waiting - no capable cell free (capable=[1, 2])
+[disp] chunk of 1 (RWW) waiting - no capable cell free (capable=[1, 2])
+[w1] PLC sync -> wood:10 metal:2
+[wh] PLC W1=12/32  W2(MES)=1/32
+[disp] RWW all subparts sent to Cell_2
+[w1] -1 Wood (now wood:9 metal:2)
+[w1] -1 Wood (now wood:8 metal:2)
+[w1] -1 Wood (now wood:7 metal:2)
+[disp] RWW (db id 12, wire 34) -> Cell_2 as 3 subparts (hint was Cell_2)
+[w1] PLC sync -> wood:10 metal:2
+[opcua] WARN: Router did not consume the route within timeout; it may have been dropped
+[complex] RWM: route top -> Cell_2 M1 shape, transfer, assemble@Cell_3
+[w1] PLC sync -> wood:9 metal:2
+[wh] PLC W1=11/32  W2(MES)=1/32
+
+=== [sim] New day: 8 ===
+[mqtt-out] factory/erp/end_of_day -> {"sim_day": 7}
+[mqtt] end_of_day (sim_day 7): discharging docks
+[unload] end-of-day: nothing on docks to dispatch
+[plan] baseline Wood: deficit 1, ordering (fast)
+[plan] purchase: 2 Wood from SupplierA (order day 8, arrives day 8, cost 20.00€, remaining -1)
+[plan] baseline Metal: deficit 7, ordering (fast)
+[plan] purchase: 8 Metal from SupplierA (order day 8, arrives day 8, cost 120.00€, remaining -1)
+[plan] replan done: 0/0 pieces scheduled (0 from finished stock), 0 material demands evaluated, stock_at_start=wood:11 metal:1
+[dispatch] day 8: sending material_load 2 Wood to MES (W1 inventory updated)
+[mqtt-out] factory/erp/material_load/wood -> {"command": "load_material", "type": "Wood", "quantity": 2, "message_id": "b734ad1a-eafd-47a8-8d03-2a4c7f90b64c"}
+[dispatch] day 8: sending material_load 8 Metal to MES (W1 inventory updated)
+[mqtt-out] factory/erp/material_load/metal -> {"command": "load_material", "type": "Metal", "quantity": 8, "message_id": "610806f4-2bcc-42c5-8806-5234ae5ecd05"}
+[mqtt] material_load +wood=2 +metal=0 (pending buffer: wood=2 metal=0)
+[mqtt] flush_loader dispatching wood=2 metal=0
+[opcua] batched-load: batch #1 wood=2 metal=0 (remaining wood=0, metal=0)
+[opcua] trigger_loader_batch wood=2 metal=0
+[mqtt] material_load +wood=0 +metal=8 (pending buffer: wood=0 metal=8)
+[w1] PLC sync -> wood:11 metal:2
+[wh] PLC W1=13/32  W2(MES)=1/32
+[mqtt-out] factory/erp/production_orders -> {"sim_day": 8, "items": [{"production_plan_id": 17, "order_line_id": 3, "piece_type": "RMM", "quantity": 1}, {"production_plan_id": 18, "order_line_id": 3, "piece_type": "RMM", "quantity": 1}]}
+[mqtt-out] factory/erp/delivery_orders -> {"sim_day": 8, "items": [{"production_plan_id": 17, "order_line_id": 3, "piece_type": "RMM", "quantity": 1, "line_quantity": 5, "ddate": 15, "client_order_id": 1001, "client_name": "Fools'n Horses"}, {"production_plan_id": 18, "order_line_id": 3, "piece_type": "RMM", "quantity": 1, "line_quantity": 5, "ddate": 15, "client_order_id": 1001, "client_name": "Fools'n Horses"}]}
+[mqtt] queued 2 pieces from production_orders
+[mqtt] delivery_orders: 2 item(s) for sim_day 8
+[unload] line 3 (client=Fools'n Horses order=1001 RMMx5 ddate=15): need 5 on docks
+[unload] line 3 (client=Fools'n Horses order=1001 RMMx5 ddate=15): need 5 on docks
+[dispatch] day 8: dispatched 2 pieces to MES (0 from stock), 0 held for material
+[opcua] batched-load: complete (total wood=2 metal=0)
+[w1] +wood=2 +metal=0 (now wood:13 metal:2)
+[mqtt] flush_loader dispatching wood=0 metal=8
+[opcua] batched-load: batch #1 wood=0 metal=5 (remaining wood=0, metal=3)
+[w1] PLC sync -> wood:11 metal:2
+[opcua] trigger_loader_batch wood=0 metal=5
+[disp] tick #736: 6 queued, w1=wood:11/metal:2, free={1: False, 2: False, 3: False, 4: False}
+[disp] chunk of 1 (RMM) waiting - need wood:0 metal:3 (have wood:11 metal:2)
+[disp] chunk of 1 (RMM) waiting - need wood:0 metal:3 (have wood:11 metal:2)
+[disp] chunk of 1 (RMM) waiting - need wood:0 metal:3 (have wood:11 metal:2)
+[disp] chunk of 1 (RMM) waiting - need wood:0 metal:3 (have wood:11 metal:2)
+[disp] chunk of 1 (RWW) waiting - no capable cell free (capable=[1, 2])
+[mqtt-out] factory/mes/status -> {"order_id": null, "order_line_id": 1, "piece_db_id": 10, "piece_type": "RWW", "status": "COMPLETED", "real_cost": 0.0}
+[done] wire=19 (RWW) COMPLETED
+[unload] W2 +1 RWW (available 2)
+[erp] inventory sync: +1 RWW (finished)
+[w1] PLC sync -> wood:11 metal:7
+[wh] PLC W1=18/32  W2(MES)=2/32
+[opcua] batched-load: batch #2 wood=0 metal=3 (remaining wood=0, metal=0)
+[opcua] trigger_loader_batch wood=0 metal=3
+[w1] PLC sync -> wood:11 metal:10
+[wh] PLC W1=21/32  W2(MES)=2/32
+[opcua] batched-load: complete (total wood=0 metal=8)
+[w1] +wood=0 +metal=8 (now wood:11 metal:18)
+[w1] PLC sync -> wood:11 metal:10
+[disp] tick #756: 6 queued, w1=wood:11/metal:10, free={1: False, 2: False, 3: False, 4: False}
+[disp] chunk of 1 (RMM) waiting - no capable cell free (capable=[3, 4])
+[disp] chunk of 1 (RMM) waiting - no capable cell free (capable=[3, 4])
+[disp] chunk of 1 (RMM) waiting - no capable cell free (capable=[3, 4])
+[disp] chunk of 1 (RMM) waiting - no capable cell free (capable=[3, 4])
+[disp] chunk of 1 (RWW) waiting - no capable cell free (capable=[1, 2])
+[opcua] WARN: Router did not consume the route within timeout; it may have been dropped
+[complex] RWM (db id 14, wire 26) fully routed to PLC; completion will arrive via g_Done buffer
+[w1] PLC sync -> wood:10 metal:10
+[wh] PLC W1=20/32  W2(MES)=2/32
+[w1] PLC sync -> wood:9 metal:10
+[wh] PLC W1=19/32  W2(MES)=2/32
+[disp] tick #776: 6 queued, w1=wood:9/metal:10, free={1: False, 2: False, 3: False, 4: False}
+[disp] chunk of 1 (RMM) waiting - no capable cell free (capable=[3, 4])
+[disp] chunk of 1 (RMM) waiting - no capable cell free (capable=[3, 4])
+[disp] chunk of 1 (RMM) waiting - no capable cell free (capable=[3, 4])
+[disp] chunk of 1 (RMM) waiting - no capable cell free (capable=[3, 4])
+[disp] chunk of 1 (RWW) waiting - no capable cell free (capable=[1, 2])
+[disp] RWW all subparts sent to Cell_2
+[w1] -1 Wood (now wood:8 metal:10)
+[w1] -1 Wood (now wood:7 metal:10)
+[w1] -1 Wood (now wood:6 metal:10)
+[disp] RWW (db id 13, wire 37) -> Cell_2 as 3 subparts (hint was Cell_2)
+[w1] PLC sync -> wood:8 metal:10
+[wh] PLC W1=18/32  W2(MES)=2/32
+[mqtt-out] factory/mes/status -> {"order_id": null, "order_line_id": 1, "piece_db_id": 11, "piece_type": "RWW", "status": "COMPLETED", "real_cost": 0.0}
+[done] wire=29 (RWW) COMPLETED
+[unload] W2 +1 RWW (available 3)
+[erp] inventory sync: +1 RWW (finished)
+[wh] PLC W1=18/32  W2(MES)=3/32
+[disp] tick #796: 5 queued, w1=wood:8/metal:10, free={1: False, 2: False, 3: False, 4: False}
+[disp] chunk of 1 (RMM) waiting - no capable cell free (capable=[3, 4])
+[disp] chunk of 1 (RMM) waiting - no capable cell free (capable=[3, 4])
+[disp] chunk of 1 (RMM) waiting - no capable cell free (capable=[3, 4])
+[disp] chunk of 1 (RMM) waiting - no capable cell free (capable=[3, 4])
+[mqtt-out] factory/mes/status -> {"order_id": null, "order_line_id": 3, "piece_db_id": 5, "piece_type": "RMM", "status": "COMPLETED", "real_cost": 0.0}
+[done] wire=21 (RMM) COMPLETED
+[unload] W2 +1 RMM (available 1)
+[erp] inventory sync: +1 RMM (finished)
+[wh] PLC W1=18/32  W2(MES)=4/32
+[opcua] dock 1: filled 1x piece 13 (now 1/6)
+[unload] placed 1x RMM on dock 1 for line 3 (dock 1/6)
+[mqtt-out] factory/mes/status -> {"event": "DOCK_LOADED", "dock": 1, "order_line_id": 3, "piece_type": "RMM", "quantity": 1}
+[unload] line 3 (client=Fools'n Horses order=1001): 1/5 on dock(s) [1], 4 still needed
+[wh] PLC W1=18/32  W2(MES)=3/32
+[disp] tick #816: 5 queued, w1=wood:8/metal:10, free={1: False, 2: False, 3: False, 4: False}
+[disp] chunk of 1 (RMM) waiting - no capable cell free (capable=[3, 4])
+[disp] chunk of 1 (RMM) waiting - no capable cell free (capable=[3, 4])
+[disp] chunk of 1 (RMM) waiting - no capable cell free (capable=[3, 4])
+[disp] chunk of 1 (RMM) waiting - no capable cell free (capable=[3, 4])
+^C
+[erp] shutting down.
+
+[run_all] Stopping all subsystems...
+
+
+Is it optimal to only buy 4 pieces of wood or metal??? why is it doing that? you can check how the supply is done by seeing the logs and how and when is the wh getting its items??

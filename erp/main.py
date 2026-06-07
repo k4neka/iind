@@ -49,8 +49,43 @@ def main():
             except Exception as e:
                 print(f"[dispatch] error: {e}")
 
-    # Compute the initial plan but do not dispatch on startup beyond what
-    # do_plan does (no material has arrived yet).
+    # Client orders are handled by ONE coalescing worker thread, not a thread
+    # per order: the TCP handler just signals (instant response, v3 Bug 1) and
+    # the worker runs a single replan+dispatch, draining a burst of orders in
+    # one pass. This removes the concurrent-replan race entirely.
+    order_event = threading.Event()
+
+    def order_worker():
+        while True:
+            order_event.wait()
+            order_event.clear()
+            do_plan(clock.current_day())
+
+    def on_new_order(_day: int):
+        order_event.set()
+
+    # Start the TCP server NOW, BEFORE waiting for the MES: run_all.sh waits for
+    # :6666 to come up before it launches the MES, so the server must be up
+    # first (otherwise we'd deadlock waiting for a MES that is never started).
+    # Orders that arrive during the wait are persisted; the worker drains them
+    # once the MES is online.
+    server = OrderServer(clock, on_new_order)
+    server.start()
+
+    # Do NOT send the MES anything until it is connected to the PLC (Codesys)
+    # and MQTT. Otherwise the day-0 material_load is published before the MES
+    # subscribes and is dropped as a stale-retained message at its boot (the
+    # baseline cargo never reaches the simulator).
+    print("[erp] waiting for the MES to come online (PLC + MQTT)...")
+    if mqtt.wait_mes_ready(timeout=300):
+        print("[erp] MES online -> starting simulation")
+    else:
+        print("[erp] WARN: MES not online after 300s; starting anyway")
+    # Anchor sim day 0 to the instant the MES is ready, so day-0 material/orders
+    # are dispatched to a live MES and purchase arrivals line up.
+    clock.reset_epoch()
+
+    # First plan + dispatch (now that the MES can actually receive it).
     do_plan(clock.current_day())
 
     def on_new_day(day: int):
@@ -69,25 +104,7 @@ def main():
     clock.add_day_listener(on_new_day)
     clock.start()
 
-    # Client orders are handled by ONE coalescing worker thread, not a thread
-    # per order: the TCP handler just signals (instant response, v3 Bug 1) and
-    # the worker runs a single replan+dispatch, draining a burst of orders in
-    # one pass. This removes the concurrent-replan race entirely.
-    order_event = threading.Event()
-
-    def order_worker():
-        while True:
-            order_event.wait()
-            order_event.clear()
-            do_plan(clock.current_day())
-
     threading.Thread(target=order_worker, daemon=True).start()
-
-    def on_new_order(_day: int):
-        order_event.set()
-
-    server = OrderServer(clock, on_new_order)
-    server.start()
 
     _stop = threading.Event()
     try:

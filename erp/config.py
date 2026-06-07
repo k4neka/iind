@@ -13,6 +13,9 @@ MQTT_TOPIC_PRODUCTION  = "factory/erp/production_orders"
 MQTT_TOPIC_DELIVERY    = "factory/erp/delivery_orders"
 MQTT_TOPIC_END_OF_DAY  = "factory/erp/end_of_day"
 MQTT_TOPIC_MES_STATUS  = "factory/mes/status"
+# Retained MES readiness flag (PLC + MQTT connected). The ERP holds all
+# material/production/delivery dispatch until it sees {"ready": true} here.
+MQTT_TOPIC_MES_ONLINE  = "factory/mes/online"
 
 # Material load: um tópico distinto por material para evitar colisão de retain
 MQTT_TOPIC_MATERIAL_LOAD       = "factory/erp/material_load"        # legado
@@ -46,7 +49,7 @@ QUEUE_FACTOR       = 1.5   # inflate transfer time when the line is busy
 TIME_TOLERANCE_S   = 5
 
 # --- Plant limits ---
-WAREHOUSE_CAPACITY = 32
+WAREHOUSE_CAPACITY = 30
 MAX_UNLOAD_PER_DAY = 30
 
 # --- Predictive pre-ordering (buffer stock) ---

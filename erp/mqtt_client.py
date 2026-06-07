@@ -10,7 +10,7 @@ from config import (MQTT_BROKER, MQTT_PORT,
                     MQTT_TOPIC_MATERIAL_LOAD_WOOD,
                     MQTT_TOPIC_MATERIAL_LOAD_METAL,
                     MQTT_TOPIC_MATERIAL_LOAD,
-                    MQTT_TOPIC_END_OF_DAY)
+                    MQTT_TOPIC_END_OF_DAY, MQTT_TOPIC_MES_ONLINE)
 from database import log_mes_status, update_inventory
 
 try:
@@ -32,6 +32,11 @@ class MQTTBridge:
     def __init__(self):
         self.connected = False
         self.client = None
+        # Set whenever the MES is connected to the PLC + MQTT (its retained
+        # factory/mes/online flag). The ERP holds all dispatch until this is
+        # set, so material/production/delivery are never published to a MES
+        # that isn't there to receive them.
+        self.mes_ready = threading.Event()
         if mqtt is None:
             print("[mqtt] paho-mqtt not installed; running in stub mode")
             return
@@ -48,6 +53,7 @@ class MQTTBridge:
         self.connected = (rc == 0)
         print(f"[mqtt] connected rc={rc}")
         client.subscribe(MQTT_TOPIC_MES_STATUS)
+        client.subscribe(MQTT_TOPIC_MES_ONLINE)
         # Wipe stale retained messages so the MES doesn't replay them.
         self._wipe_retained()
 
@@ -59,6 +65,9 @@ class MQTTBridge:
         print("[mqtt] wiped retained messages on material_load topics")
 
     def _on_message(self, client, userdata, msg):
+        if msg.topic == MQTT_TOPIC_MES_ONLINE:
+            self._handle_mes_online(msg.payload)
+            return
         try:
             payload = msg.payload.decode("utf-8")
             log_mes_status(time.time(), msg.topic, payload)
@@ -66,6 +75,30 @@ class MQTTBridge:
             print(f"[mqtt] on_message error: {e}")
             return
         self._sync_inventory(payload)
+
+    def _handle_mes_online(self, raw):
+        if not raw:                       # wiped/empty retained -> ignore
+            return
+        try:
+            ready = bool(json.loads(raw.decode("utf-8")).get("ready"))
+        except Exception:
+            return
+        if ready:
+            if not self.mes_ready.is_set():
+                print("[erp] MES is online (PLC + MQTT ready)")
+            self.mes_ready.set()
+        else:
+            if self.mes_ready.is_set():
+                print("[erp] MES went offline; holding dispatch")
+            self.mes_ready.clear()
+
+    def wait_mes_ready(self, timeout=None) -> bool:
+        """Block until the MES reports it is online (or timeout). Returns True
+        if the MES is online."""
+        return self.mes_ready.wait(timeout)
+
+    def is_mes_ready(self) -> bool:
+        return self.mes_ready.is_set()
 
     def _sync_inventory(self, raw_payload):
         """Keep the ERP inventory table in lock-step with the plant.

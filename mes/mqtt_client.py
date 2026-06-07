@@ -16,7 +16,7 @@ from config import (MQTT_BROKER, MQTT_PORT,
                     TOPIC_MATERIAL_LOAD, TOPIC_MATERIAL_LOAD_WOOD,
                     TOPIC_MATERIAL_LOAD_METAL,
                     TOPIC_PRODUCTION_ORDERS, TOPIC_MES_STATUS, MAX_QUEUED,
-                    TOPIC_DELIVERY_ORDERS, TOPIC_END_OF_DAY)
+                    TOPIC_DELIVERY_ORDERS, TOPIC_END_OF_DAY, TOPIC_MES_ONLINE)
 from database import (enqueue_piece, queued_pieces, is_message_consumed,
                       mark_message_consumed)
 
@@ -99,11 +99,26 @@ class MESMqtt:
 
     def start(self):
         try:
+            # Last will: if the MES drops, the broker flips the readiness flag
+            # to false (retained) so the ERP stops sending it orders.
+            self.client.will_set(TOPIC_MES_ONLINE,
+                                 json.dumps({"ready": False}),
+                                 qos=1, retain=True)
             self.client.connect(MQTT_BROKER, MQTT_PORT, 60)
             threading.Thread(target=self.client.loop_forever,
                              daemon=True).start()
         except Exception as e:
             print(f"[mqtt] could not connect: {e}")
+
+    def publish_online(self, ready: bool = True):
+        """Announce MES readiness (retained) so the ERP only sends orders once
+        the MES is connected to the PLC (Codesys) and MQTT."""
+        try:
+            self.client.publish(TOPIC_MES_ONLINE,
+                                json.dumps({"ready": bool(ready)}),
+                                qos=1, retain=True)
+        except Exception as e:
+            print(f"[mqtt] publish_online failed: {e}")
 
     def _on_connect(self, client, userdata, flags, rc):
         self.connected = (rc == 0)

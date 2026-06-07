@@ -185,7 +185,8 @@ def _pending_inbound(material: str, by_day=None) -> int:
 
 
 def _place_tranched(material, net_qty, current_day, horizon_end,
-                    ddate, penalty, prod_days, w1_proj, piece_type=None, prefer_fast=False):
+                    ddate, penalty, prod_days, w1_proj, piece_type=None,
+                    prefer_fast=False, preferred_supplier=None):
     """Order `net_qty` of `material` in W1-sized tranches (v3 Bug 2).
 
     A single oversized purchase (e.g. 36 wood) never fits W1 (cap 32) and the
@@ -195,10 +196,13 @@ def _place_tranched(material, net_qty, current_day, horizon_end,
     and frees room for the next tranche. `w1_proj` (day -> projected stock) is
     updated in place so successive tranches/materials see the committed ones.
 
-    `prefer_fast` picks the lowest-lead supplier (so the material lands as soon
-    as possible) instead of the cost-benefit choice — used for the baseline
-    buffer, whose whole purpose is instant availability."""
-    if prefer_fast:
+    `preferred_supplier` forces a specific supplier for the baseline buffer;
+    `prefer_fast` still exists for the rare case where the fastest supplier is
+    desired instead of the cost-benefit choice."""
+    if preferred_supplier is not None:
+        supplier = preferred_supplier
+        info = SUPPLIERS[supplier][material]
+    elif prefer_fast:
         name = min(SUPPLIERS, key=lambda s: SUPPLIERS[s][material]["lead"])
         info = SUPPLIERS[name][material]
         supplier = name
@@ -250,14 +254,13 @@ def ensure_baseline_stock(current_day: int):
         deficit = target - have
         if deficit <= 0:
             continue
-        print(f"[plan] baseline {material}: deficit {deficit}, ordering (fast)")
-        # Buffer must be available ASAP, so order from the lowest-lead supplier
-        # (so day-0 orders can start on day 0 instead of waiting for a slow
-        # bulk delivery). Client-demand purchases still use the cost-benefit
-        # supplier choice.
+        print(f"[plan] baseline {material}: deficit {deficit}, ordering via SupplierB")
+        # The startup buffer should come from the bulk supplier so the plant
+        # begins with the slower but cheaper inbound flow, not the day-0 fast
+        # supplier. Client-demand purchases still use the cost-benefit choice.
         _place_tranched(material, deficit, current_day, horizon_end,
                         ddate=horizon_end, penalty=0.0, prod_days=1,
-                        w1_proj=w1_proj, prefer_fast=True)
+                w1_proj=w1_proj, preferred_supplier="SupplierB")
 
 
 # ---------------------------------------------------------------------------
@@ -462,6 +465,14 @@ def replan(current_day: int):
 # ---------------------------------------------------------------------------
 
 def dispatch_today(current_day: int, mqtt_bridge):
+    # Hold ALL dispatch until the MES is online (connected to the PLC + MQTT).
+    # Otherwise material_load / production / delivery are published to a MES
+    # that isn't subscribed yet and get dropped as stale-retained at its boot.
+    # (Guarded with hasattr so test stubs without the flag still dispatch.)
+    if hasattr(mqtt_bridge, "is_mes_ready") and not mqtt_bridge.is_mes_ready():
+        print(f"[dispatch] day {current_day}: MES offline; holding dispatch")
+        return
+
     # --- 1. Raw-material arrivals FIRST, so today's production can use them.
     arrivals = purchases_arriving_on(current_day)
     for p in arrivals:
