@@ -16,12 +16,17 @@ fi
 # shellcheck disable=SC1090
 source "$VENV_DIR/bin/activate"
 
-echo "[mes] upgrading pip..."
-python3 -m pip install --quiet --upgrade pip
+echo "[mes] ensuring venv packages (pip upgrade optional)..."
+if [ "${SKIP_PIP_UPGRADE:-0}" != "1" ]; then
+    echo "[mes] upgrading pip..."
+    python3 -m pip install --quiet --upgrade pip || \
+        echo "[mes] pip upgrade skipped or failed (platform-managed)"
+fi
 
 if [ -f "requirements.txt" ]; then
     echo "[mes] installing requirements..."
-    python3 -m pip install --quiet -r requirements.txt
+    python3 -m pip install --quiet -r requirements.txt || \
+        echo "[mes] requirements install skipped or partially failed"
 fi
 
 echo "[mes] starting MES (main.py)..."
